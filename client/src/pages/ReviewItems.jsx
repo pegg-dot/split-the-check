@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useState, useMemo } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useSession } from '../context/SessionContext';
 
@@ -12,6 +12,25 @@ export default function ReviewItems() {
   const [newName, setNewName] = useState('');
   const [newPrice, setNewPrice] = useState('');
   const [taxInput, setTaxInput] = useState(state.tax > 0 ? state.tax.toFixed(2) : '');
+
+  // Group items by name + price for display
+  const groupedItems = useMemo(() => {
+    const groups = [];
+    const map = new Map();
+
+    for (const item of state.items) {
+      const key = `${item.name}|||${item.price.toFixed(2)}`;
+      if (map.has(key)) {
+        map.get(key).items.push(item);
+        map.get(key).count += 1;
+      } else {
+        const group = { name: item.name, price: item.price, count: 1, items: [item] };
+        map.set(key, group);
+        groups.push(group);
+      }
+    }
+    return groups;
+  }, [state.items]);
 
   function startEdit(item) {
     setEditingId(item.id);
@@ -30,6 +49,12 @@ export default function ReviewItems() {
     if (editingId === id) setEditingId(null);
   }
 
+  function deleteGroup(group) {
+    for (const item of group.items) {
+      dispatch({ type: 'DELETE_ITEM', id: item.id });
+    }
+  }
+
   function addItem() {
     if (!newName.trim() || !newPrice) return;
     dispatch({ type: 'ADD_ITEM', name: newName.trim(), price: parseFloat(newPrice) || 0 });
@@ -45,6 +70,11 @@ export default function ReviewItems() {
 
   const formatPrice = (p) => `$${p.toFixed(2)}`;
 
+  // Check if any item in a group is being edited
+  const editingGroup = editingId !== null
+    ? groupedItems.find(g => g.items.some(i => i.id === editingId))
+    : null;
+
   return (
     <div className="page">
       <div className="page-header">
@@ -59,10 +89,13 @@ export default function ReviewItems() {
           </div>
         )}
 
-        {state.items.map((item) => (
-          <div key={item.id}>
-            {editingId === item.id ? (
-              <div style={{ padding: '12px 0', borderBottom: '1px solid var(--color-border-light)' }}>
+        {groupedItems.map((group) => {
+          const isEditingThisGroup = editingGroup === group;
+
+          if (isEditingThisGroup) {
+            const editItem = group.items.find(i => i.id === editingId);
+            return (
+              <div key={editItem.id} style={{ padding: '12px 0', borderBottom: '1px solid var(--color-border-light)' }}>
                 <div style={{ display: 'flex', gap: '8px', marginBottom: '8px' }}>
                   <input
                     className="input"
@@ -84,17 +117,31 @@ export default function ReviewItems() {
                 <div style={{ display: 'flex', gap: '8px' }}>
                   <button className="btn btn-primary btn-sm" onClick={saveEdit} style={{ flex: 1 }}>Save</button>
                   <button className="btn btn-ghost btn-sm" onClick={() => setEditingId(null)}>Cancel</button>
-                  <button className="btn btn-sm" onClick={() => deleteItem(item.id)} style={{ color: 'var(--color-accent)', background: 'var(--color-accent-light)' }}>Delete</button>
+                  <button className="btn btn-sm" onClick={() => deleteItem(editItem.id)} style={{ color: 'var(--color-accent)', background: 'var(--color-accent-light)' }}>Delete</button>
                 </div>
               </div>
-            ) : (
-              <div className="item-row" onClick={() => startEdit(item)} style={{ cursor: 'pointer' }}>
-                <span className="item-name">{item.name}</span>
-                <span className="item-price">{formatPrice(item.price)}</span>
+            );
+          }
+
+          return (
+            <div
+              key={group.items[0].id}
+              className="item-row"
+              onClick={() => startEdit(group.items[0])}
+              style={{ cursor: 'pointer' }}
+            >
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <span className="item-name">{group.name}</span>
+                {group.count > 1 && (
+                  <span className="text-sm text-muted" style={{ display: 'block', marginTop: '2px' }}>
+                    {group.count} x {formatPrice(group.price)} each
+                  </span>
+                )}
               </div>
-            )}
-          </div>
-        ))}
+              <span className="item-price">{formatPrice(group.price * group.count)}</span>
+            </div>
+          );
+        })}
 
         {addingNew && (
           <div style={{ padding: '12px 0' }}>

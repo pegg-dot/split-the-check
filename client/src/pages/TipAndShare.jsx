@@ -1,6 +1,7 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useSession } from '../context/SessionContext';
+import { socket } from '../context/socket';
 import { QRCodeSVG } from 'qrcode.react';
 
 export default function TipAndShare() {
@@ -17,11 +18,54 @@ export default function TipAndShare() {
 
   const sessionUrl = `${window.location.origin}/session/${sessionId}`;
 
+  useEffect(() => {
+    if (!socket.connected) {
+      socket.connect();
+    }
+  }, []);
+
+  function handleShare() {
+    // Create session on server
+    socket.emit('create-session', {
+      sessionId,
+      hostName: state.hostName,
+      venmoHandle: state.venmoHandle,
+      items: state.items,
+      subtotal: state.subtotal,
+      tax: state.tax,
+    });
+    setShowQR(true);
+  }
+
+  const [copied, setCopied] = useState(false);
+
   async function handleCopyLink() {
     try {
-      await navigator.clipboard.writeText(sessionUrl);
+      // Try modern clipboard API first
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(sessionUrl);
+      } else {
+        // Fallback for non-HTTPS (LAN IP)
+        const textArea = document.createElement('textarea');
+        textArea.value = sessionUrl;
+        textArea.style.position = 'fixed';
+        textArea.style.left = '-9999px';
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      }
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
     } catch {
-      // Fallback — just show the QR
+      // Last resort — select the URL text so user can manually copy
+      const urlEl = document.querySelector('.session-url');
+      if (urlEl) {
+        const range = document.createRange();
+        range.selectNodeContents(urlEl);
+        window.getSelection().removeAllRanges();
+        window.getSelection().addRange(range);
+      }
     }
   }
 
@@ -41,12 +85,12 @@ export default function TipAndShare() {
             bgColor="transparent"
             fgColor="#1a1a1a"
           />
-          <p className="text-sm fw-700" style={{ wordBreak: 'break-all' }}>{sessionUrl}</p>
+          <p className="text-sm fw-700 session-url" style={{ wordBreak: 'break-all', userSelect: 'all' }}>{sessionUrl}</p>
         </div>
 
         <div className="mt-24 flex-col gap-8" style={{ width: '100%' }}>
           <button className="btn btn-secondary" onClick={handleCopyLink}>
-            Copy Link
+            {copied ? 'Copied!' : 'Copy Link'}
           </button>
           <button className="btn btn-primary" onClick={() => navigate(`/host/${sessionId}`)}>
             View Host Dashboard
@@ -84,7 +128,7 @@ export default function TipAndShare() {
 
       <div className="spacer" />
 
-      <button className="btn btn-primary" onClick={() => setShowQR(true)}>
+      <button className="btn btn-primary" onClick={handleShare}>
         Generate QR Code
       </button>
     </div>

@@ -94,6 +94,34 @@ function sessionReducer(state, action) {
     case 'SET_PAYMENTS': {
       return { ...state, payments: action.payments };
     }
+    case 'LOAD_SESSION': {
+      // Hydrate full session from server, preserve currentUser
+      const s = action.session;
+      return {
+        ...state,
+        hostName: s.hostName,
+        venmoHandle: s.venmoHandle,
+        items: s.items,
+        subtotal: s.subtotal,
+        tax: s.tax,
+        tipPercents: s.tipPercents || {},
+        sessionId: s.id,
+        guests: s.guests,
+        payments: s.payments || [],
+      };
+    }
+    case 'SYNC_ITEMS': {
+      return { ...state, items: action.items };
+    }
+    case 'SYNC_GUESTS': {
+      return { ...state, guests: action.guests };
+    }
+    case 'SYNC_TIP_PERCENTS': {
+      return { ...state, tipPercents: action.tipPercents };
+    }
+    case 'SYNC_PAYMENTS': {
+      return { ...state, payments: action.payments };
+    }
     default:
       return state;
   }
@@ -117,21 +145,17 @@ export function calculatePersonTotal(state, personName, tipPercent) {
     }
   }
 
-  // Unclaimed items split evenly among all participants
-  const allParticipants = getAllParticipants(state);
+  // Track unclaimed items separately — don't auto-charge anyone
   const unclaimedItems = items.filter(item => item.claims.length === 0);
-  for (const item of unclaimedItems) {
-    const share = item.price / allParticipants.length;
-    itemsTotal += share;
-    claimedItems.push({ ...item, myShare: share, isUnclaimed: true });
-  }
 
+  // Tax is proportional to your share of the FULL receipt subtotal
+  // Tip is based on your items only
   const proportion = subtotal > 0 ? itemsTotal / subtotal : 0;
   const taxShare = tax * proportion;
-  const tipShare = (subtotal * (tip / 100)) * proportion;
+  const tipShare = itemsTotal * (tip / 100);
   const total = itemsTotal + taxShare + tipShare;
 
-  return { itemsTotal, taxShare, tipPercent: tip, tipShare, total, claimedItems };
+  return { itemsTotal, taxShare, tipPercent: tip, tipShare, total, claimedItems, unclaimedItems };
 }
 
 export function getAllParticipants(state) {

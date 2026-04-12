@@ -7,11 +7,48 @@ export default function Home() {
   const { dispatch } = useSession();
   const [name, setName] = useState('');
   const [venmo, setVenmo] = useState('');
+  const [verifying, setVerifying] = useState(false);
+  const [venmoStatus, setVenmoStatus] = useState(null); // { valid, displayName, note, error }
 
-  const canStart = name.trim() && venmo.trim();
+  const canStart = name.trim() && venmo.trim() && venmoStatus?.valid;
+
+  async function verifyVenmo(handle) {
+    if (!handle.trim()) {
+      setVenmoStatus(null);
+      return;
+    }
+    setVerifying(true);
+    setVenmoStatus(null);
+    try {
+      const res = await fetch('/api/verify-venmo', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ handle: handle.trim() }),
+      });
+      const data = await res.json();
+      setVenmoStatus(data);
+    } catch {
+      setVenmoStatus({ valid: true, note: 'Could not verify — please double-check your Venmo info' });
+    } finally {
+      setVerifying(false);
+    }
+  }
+
+  function handleVenmoChange(e) {
+    const val = e.target.value;
+    setVenmo(val);
+    setVenmoStatus(null);
+  }
+
+  function handleVenmoBlur() {
+    if (venmo.trim()) {
+      verifyVenmo(venmo);
+    }
+  }
 
   function handleStart(e) {
     e.preventDefault();
+    if (!canStart) return;
     dispatch({ type: 'SET_HOST', name: name.trim(), venmoHandle: venmo.trim() });
     navigate('/scan');
   }
@@ -44,15 +81,66 @@ export default function Home() {
             type="text"
             placeholder="e.g. @sarah-jones or (555) 123-4567"
             value={venmo}
-            onChange={(e) => setVenmo(e.target.value)}
+            onChange={handleVenmoChange}
+            onBlur={handleVenmoBlur}
+            style={{
+              borderColor: venmoStatus
+                ? venmoStatus.valid
+                  ? 'var(--color-success)'
+                  : 'var(--color-accent)'
+                : undefined,
+            }}
           />
-          <p className="text-sm text-muted mt-8">
-            This is where your friends will send payment
-          </p>
+
+          {/* Verification status */}
+          {verifying && (
+            <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginTop: '8px' }}>
+              <div className="spinner" style={{ width: '16px', height: '16px', borderWidth: '2px' }} />
+              <span className="text-sm text-muted">Checking Venmo...</span>
+            </div>
+          )}
+
+          {venmoStatus && !verifying && venmoStatus.valid && (
+            <div style={{ marginTop: '8px' }}>
+              {venmoStatus.displayName ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ color: 'var(--color-success)', fontWeight: 700, fontSize: '1rem' }}>✓</span>
+                  <span className="text-sm" style={{ color: 'var(--color-success)', fontWeight: 600 }}>
+                    {venmoStatus.displayName}
+                  </span>
+                </div>
+              ) : venmoStatus.note ? (
+                <p className="text-sm" style={{ color: 'var(--color-warning)', fontWeight: 500 }}>
+                  ⚠ {venmoStatus.note}
+                </p>
+              ) : (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
+                  <span style={{ color: 'var(--color-success)', fontWeight: 700, fontSize: '1rem' }}>✓</span>
+                  <span className="text-sm" style={{ color: 'var(--color-success)', fontWeight: 600 }}>
+                    Venmo account found
+                  </span>
+                </div>
+              )}
+            </div>
+          )}
+
+          {venmoStatus && !verifying && !venmoStatus.valid && (
+            <div style={{ marginTop: '8px' }}>
+              <p className="text-sm" style={{ color: 'var(--color-accent)', fontWeight: 500 }}>
+                {venmoStatus.error || 'Venmo account not found'}
+              </p>
+            </div>
+          )}
+
+          {!venmoStatus && !verifying && (
+            <p className="text-sm text-muted mt-8">
+              This is where your friends will send payment
+            </p>
+          )}
         </div>
 
-        <button type="submit" className="btn btn-primary mt-16" disabled={!canStart}>
-          Start Splitting
+        <button type="submit" className="btn btn-primary mt-16" disabled={!canStart || verifying}>
+          {verifying ? 'Verifying...' : 'Start Splitting'}
         </button>
       </form>
     </div>

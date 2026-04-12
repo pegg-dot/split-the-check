@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate, useParams } from 'react-router-dom';
 import { useSession, calculatePersonTotal } from '../context/SessionContext';
+import { socket } from '../context/socket';
 
 export default function ClaimItems() {
   const { sessionId } = useParams();
@@ -12,10 +13,34 @@ export default function ClaimItems() {
   const myName = state.currentUser?.name;
   const formatPrice = (p) => `$${p.toFixed(2)}`;
 
+  // Listen for real-time item updates
+  useEffect(() => {
+    function onItemClaimed({ items }) {
+      dispatch({ type: 'SYNC_ITEMS', items });
+    }
+    function onItemUnclaimed({ items }) {
+      dispatch({ type: 'SYNC_ITEMS', items });
+    }
+    function onGuestJoined({ guests }) {
+      dispatch({ type: 'SYNC_GUESTS', guests });
+    }
+
+    socket.on('item-claimed', onItemClaimed);
+    socket.on('item-unclaimed', onItemUnclaimed);
+    socket.on('guest-joined', onGuestJoined);
+
+    return () => {
+      socket.off('item-claimed', onItemClaimed);
+      socket.off('item-unclaimed', onItemUnclaimed);
+      socket.off('guest-joined', onGuestJoined);
+    };
+  }, [dispatch]);
+
   function handleClaim(item) {
     const myClaim = item.claims.find(c => c.guestName === myName);
     if (myClaim) {
       // Unclaim
+      socket.emit('unclaim-item', { sessionId, itemId: item.id, guestName: myName });
       dispatch({ type: 'UNCLAIM_ITEM', itemId: item.id, guestName: myName });
     } else {
       // Show split modal
@@ -26,6 +51,12 @@ export default function ClaimItems() {
 
   function confirmClaim() {
     if (!splitModalItem) return;
+    socket.emit('claim-item', {
+      sessionId,
+      itemId: splitModalItem.id,
+      guestName: myName,
+      splitCount: splitCount,
+    });
     dispatch({
       type: 'CLAIM_ITEM',
       itemId: splitModalItem.id,
@@ -35,14 +66,27 @@ export default function ClaimItems() {
     setSplitModalItem(null);
   }
 
+  const isHost = state.currentUser?.isHost;
+
   function handleDone() {
-    navigate(`/summary/${sessionId}`);
+    if (isHost) {
+      navigate(`/host/${sessionId}`);
+    } else {
+      navigate(`/summary/${sessionId}`);
+    }
   }
 
   const myTotal = calculatePersonTotal(state, myName);
 
   return (
     <div className="page">
+      <button
+        className="btn btn-ghost btn-sm"
+        onClick={() => navigate(-1)}
+        style={{ alignSelf: 'flex-start', marginBottom: '8px', padding: '6px 0' }}
+      >
+        ← Back
+      </button>
       <div className="page-header">
         <h2>Hey {myName} 👋</h2>
         <p>Tap the items you ordered</p>
@@ -57,7 +101,7 @@ export default function ClaimItems() {
           return (
             <div
               key={item.id}
-              className={`item-row ${isClaimed ? '' : ''}`}
+              className="item-row"
               onClick={() => handleClaim(item)}
               style={{ cursor: 'pointer' }}
             >
@@ -82,7 +126,6 @@ export default function ClaimItems() {
                   </span>
                   <span className="item-name">{item.name}</span>
                 </div>
-                {/* Show who claimed shares */}
                 {(otherClaims.length > 0 || (myClaim && myClaim.splitCount > 1)) && (
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '6px', marginLeft: '30px' }}>
                     {myClaim && myClaim.splitCount > 1 && (

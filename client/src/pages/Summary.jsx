@@ -1,6 +1,7 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useParams } from 'react-router-dom';
 import { useSession, calculatePersonTotal } from '../context/SessionContext';
+import { socket } from '../context/socket';
 
 const TIP_PRESETS = [15, 18, 20];
 
@@ -18,10 +19,34 @@ export default function Summary() {
   const myTotal = calculatePersonTotal(state, myName, tipPercent);
   const formatPrice = (p) => `$${p.toFixed(2)}`;
 
+  // Listen for real-time updates
+  useEffect(() => {
+    function onItemClaimed({ items }) {
+      dispatch({ type: 'SYNC_ITEMS', items });
+    }
+    function onItemUnclaimed({ items }) {
+      dispatch({ type: 'SYNC_ITEMS', items });
+    }
+    function onGuestJoined({ guests }) {
+      dispatch({ type: 'SYNC_GUESTS', guests });
+    }
+
+    socket.on('item-claimed', onItemClaimed);
+    socket.on('item-unclaimed', onItemUnclaimed);
+    socket.on('guest-joined', onGuestJoined);
+
+    return () => {
+      socket.off('item-claimed', onItemClaimed);
+      socket.off('item-unclaimed', onItemUnclaimed);
+      socket.off('guest-joined', onGuestJoined);
+    };
+  }, [dispatch]);
+
   function selectTip(pct) {
     setIsCustom(false);
     setTipPercent(pct);
     dispatch({ type: 'SET_TIP_PERCENT', name: myName, percent: pct });
+    socket.emit('set-tip', { sessionId, name: myName, percent: pct });
   }
 
   function handleCustomTip(val) {
@@ -30,6 +55,7 @@ export default function Summary() {
     if (!isNaN(parsed) && parsed >= 0) {
       setTipPercent(parsed);
       dispatch({ type: 'SET_TIP_PERCENT', name: myName, percent: parsed });
+      socket.emit('set-tip', { sessionId, name: myName, percent: parsed });
     }
   }
 
@@ -62,18 +88,30 @@ export default function Summary() {
         <h3 className="mb-8" style={{ fontSize: '0.813rem', textTransform: 'uppercase', letterSpacing: '0.05em', color: 'var(--color-text-muted)' }}>
           Your items
         </h3>
+        {myTotal.claimedItems.length === 0 && (
+          <p className="text-muted text-sm" style={{ padding: '12px 0' }}>You haven't claimed any items yet.</p>
+        )}
         {myTotal.claimedItems.map((item, i) => (
           <div key={i} className="item-row">
             <div style={{ flex: 1, minWidth: 0 }}>
               <span className="item-name">{item.name}</span>
-              {item.isUnclaimed && (
-                <span className="text-sm text-muted" style={{ display: 'block' }}>Shared with table</span>
-              )}
             </div>
             <span className="item-price">{formatPrice(item.myShare)}</span>
           </div>
         ))}
       </div>
+
+      {/* Unclaimed items warning */}
+      {myTotal.unclaimedItems.length > 0 && (
+        <div className="card mb-16" style={{ borderColor: 'var(--color-warning)', background: 'var(--color-warning-light)' }}>
+          <p style={{ fontSize: '0.875rem', fontWeight: 600, color: 'var(--color-warning)' }}>
+            {myTotal.unclaimedItems.length} item{myTotal.unclaimedItems.length > 1 ? 's' : ''} still unclaimed
+          </p>
+          <p className="text-sm text-muted mt-8">
+            {myTotal.unclaimedItems.map(i => i.name).join(', ')}
+          </p>
+        </div>
+      )}
 
       {/* Tip selector */}
       <div className="card mb-16">
@@ -144,6 +182,13 @@ export default function Summary() {
           <p className="text-muted">You're the host — you'll collect payments from everyone else.</p>
         </div>
       )}
+
+      <button
+        className="btn btn-ghost mt-12"
+        onClick={() => navigate(`/claim/${sessionId}`)}
+      >
+        Edit My Items
+      </button>
     </div>
   );
 }
