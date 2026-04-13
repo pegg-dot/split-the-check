@@ -1,26 +1,23 @@
-import { useState, useEffect } from 'react';
-import { useParams } from 'react-router-dom';
+import { useEffect } from 'react';
+import { useParams, useNavigate } from 'react-router-dom';
 import { useSession, calculatePersonTotal } from '../context/SessionContext';
 import { socket } from '../context/socket';
 
-const TIP_PRESETS = [15, 18, 20];
-
 export default function Summary() {
   const { sessionId } = useParams();
+  const navigate = useNavigate();
   const { state, dispatch } = useSession();
 
   const myName = state.currentUser?.name;
   const isHost = state.currentUser?.isHost;
-  const savedTip = state.tipPercents[myName];
-  const [tipPercent, setTipPercent] = useState(savedTip ?? 18);
-  const [customTip, setCustomTip] = useState('');
-  const [isCustom, setIsCustom] = useState(false);
-
-  const myTotal = calculatePersonTotal(state, myName, tipPercent);
+  const myTotal = calculatePersonTotal(state, myName);
   const formatPrice = (p) => `$${p.toFixed(2)}`;
 
   // Listen for real-time updates
   useEffect(() => {
+    if (!socket.connected) socket.connect();
+    socket.emit('rejoin-room', { sessionId });
+
     function onItemClaimed({ items }) {
       dispatch({ type: 'SYNC_ITEMS', items });
     }
@@ -30,34 +27,29 @@ export default function Summary() {
     function onGuestJoined({ guests }) {
       dispatch({ type: 'SYNC_GUESTS', guests });
     }
+    function onItemDisputed({ items }) {
+      dispatch({ type: 'SYNC_ITEMS', items });
+    }
+    function onReconnect() {
+      socket.emit('rejoin-room', { sessionId });
+    }
 
     socket.on('item-claimed', onItemClaimed);
     socket.on('item-unclaimed', onItemUnclaimed);
     socket.on('guest-joined', onGuestJoined);
+    socket.on('item-disputed', onItemDisputed);
+    socket.on('dispute-cancelled', onItemDisputed);
+    socket.on('connect', onReconnect);
 
     return () => {
       socket.off('item-claimed', onItemClaimed);
       socket.off('item-unclaimed', onItemUnclaimed);
       socket.off('guest-joined', onGuestJoined);
+      socket.off('item-disputed', onItemDisputed);
+      socket.off('dispute-cancelled', onItemDisputed);
+      socket.off('connect', onReconnect);
     };
-  }, [dispatch]);
-
-  function selectTip(pct) {
-    setIsCustom(false);
-    setTipPercent(pct);
-    dispatch({ type: 'SET_TIP_PERCENT', name: myName, percent: pct });
-    socket.emit('set-tip', { sessionId, name: myName, percent: pct });
-  }
-
-  function handleCustomTip(val) {
-    setCustomTip(val);
-    const parsed = parseFloat(val);
-    if (!isNaN(parsed) && parsed >= 0) {
-      setTipPercent(parsed);
-      dispatch({ type: 'SET_TIP_PERCENT', name: myName, percent: parsed });
-      socket.emit('set-tip', { sessionId, name: myName, percent: parsed });
-    }
-  }
+  }, [dispatch, sessionId]);
 
   // Build Venmo deep link
   function getVenmoLink() {
@@ -113,55 +105,24 @@ export default function Summary() {
         </div>
       )}
 
-      {/* Tip selector */}
-      <div className="card mb-16">
-        <label className="input-label mb-8">Choose your tip</label>
-        <div className="tip-options mb-8">
-          {TIP_PRESETS.map((pct) => (
-            <button
-              key={pct}
-              className={`tip-btn ${!isCustom && tipPercent === pct ? 'active' : ''}`}
-              onClick={() => selectTip(pct)}
-            >
-              {pct}%
-            </button>
-          ))}
-          <button
-            className={`tip-btn ${isCustom ? 'active' : ''}`}
-            onClick={() => setIsCustom(true)}
-          >
-            Custom
-          </button>
-        </div>
-        {isCustom && (
-          <div style={{ position: 'relative' }}>
-            <input
-              className="input"
-              type="number"
-              step="1"
-              min="0"
-              value={customTip}
-              onChange={(e) => handleCustomTip(e.target.value)}
-              placeholder="Enter tip %"
-              autoFocus
-            />
-            <span style={{ position: 'absolute', right: '16px', top: '50%', transform: 'translateY(-50%)', color: 'var(--color-text-muted)', fontWeight: 600 }}>%</span>
-          </div>
-        )}
-      </div>
-
       {/* Totals */}
       <div className="card card-surface mb-24">
         <div className="total-row">
           <span>Items</span>
           <span className="fw-700">{formatPrice(myTotal.itemsTotal)}</span>
         </div>
+        {myTotal.adminFeeShare > 0 && (
+          <div className="total-row">
+            <span>Admin Fee</span>
+            <span>{formatPrice(myTotal.adminFeeShare)}</span>
+          </div>
+        )}
         <div className="total-row">
           <span>Tax</span>
           <span>{formatPrice(myTotal.taxShare)}</span>
         </div>
         <div className="total-row">
-          <span>Tip ({tipPercent}%)</span>
+          <span>Tip {state.tipIncluded ? '(included)' : state.tipMode === 'dollar' ? '(flat)' : `(${state.tipPercent}%)`}</span>
           <span>{formatPrice(myTotal.tipShare)}</span>
         </div>
         <div className="total-row total-row-final">

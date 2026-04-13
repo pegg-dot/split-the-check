@@ -13,28 +13,46 @@ export default function ClaimItems() {
   const myName = state.currentUser?.name;
   const formatPrice = (p) => `$${p.toFixed(2)}`;
 
-  // Listen for real-time item updates
+  // Ensure socket is connected and in the room, then listen for updates
   useEffect(() => {
-    function onItemClaimed({ items }) {
-      dispatch({ type: 'SYNC_ITEMS', items });
-    }
-    function onItemUnclaimed({ items }) {
+    if (!socket.connected) socket.connect();
+    socket.emit('rejoin-room', { sessionId });
+
+    // Fetch fresh session state to pick up any claims made while we were elsewhere
+    fetch(`/api/session/${sessionId}`)
+      .then(r => r.ok ? r.json() : null)
+      .then(session => {
+        if (session) dispatch({ type: 'LOAD_SESSION', session });
+      })
+      .catch(() => {});
+
+    function onSyncItems({ items }) {
       dispatch({ type: 'SYNC_ITEMS', items });
     }
     function onGuestJoined({ guests }) {
       dispatch({ type: 'SYNC_GUESTS', guests });
     }
+    function onReconnect() {
+      console.log('[ClaimItems] Socket reconnected, rejoining room');
+      socket.emit('rejoin-room', { sessionId });
+    }
 
-    socket.on('item-claimed', onItemClaimed);
-    socket.on('item-unclaimed', onItemUnclaimed);
+    socket.on('item-claimed', onSyncItems);
+    socket.on('item-unclaimed', onSyncItems);
+    socket.on('item-disputed', onSyncItems);
+    socket.on('dispute-cancelled', onSyncItems);
     socket.on('guest-joined', onGuestJoined);
+    socket.on('connect', onReconnect);
 
     return () => {
-      socket.off('item-claimed', onItemClaimed);
-      socket.off('item-unclaimed', onItemUnclaimed);
+      socket.off('item-claimed', onSyncItems);
+      socket.off('item-unclaimed', onSyncItems);
+      socket.off('item-disputed', onSyncItems);
+      socket.off('dispute-cancelled', onSyncItems);
       socket.off('guest-joined', onGuestJoined);
+      socket.off('connect', onReconnect);
     };
-  }, [dispatch]);
+  }, [dispatch, sessionId, myName]);
 
   function handleClaim(item) {
     const myClaim = item.claims.find(c => c.guestName === myName);
@@ -42,10 +60,20 @@ export default function ClaimItems() {
       // Unclaim
       socket.emit('unclaim-item', { sessionId, itemId: item.id, guestName: myName });
       dispatch({ type: 'UNCLAIM_ITEM', itemId: item.id, guestName: myName });
-    } else {
-      // Show split modal
+    } else if (item.claims.length === 0) {
+      // Unclaimed item — show split modal
       setSplitModalItem(item);
       setSplitCount(1);
+    } else {
+      // Item has claims — check if it's a shared item (splitCount > 1)
+      const isShared = item.claims.some(c => c.splitCount > 1);
+      if (isShared) {
+        // Others can claim their share — use the same splitCount as existing claims
+        const existingSplitCount = item.claims[0].splitCount;
+        socket.emit('claim-item', { sessionId, itemId: item.id, guestName: myName, splitCount: existingSplitCount });
+        dispatch({ type: 'CLAIM_ITEM', itemId: item.id, guestName: myName, splitCount: existingSplitCount });
+      }
+      // If splitCount === 1, it's locked — use dispute button instead
     }
   }
 
@@ -66,9 +94,28 @@ export default function ClaimItems() {
     setSplitModalItem(null);
   }
 
+  function handleDispute(item, e) {
+    e.stopPropagation();
+    socket.emit('dispute-item', { sessionId, itemId: item.id, disputerName: myName });
+    dispatch({ type: 'DISPUTE_ITEM', itemId: item.id, disputerName: myName });
+  }
+
+  function handleCancelDispute(item, e) {
+    e.stopPropagation();
+    socket.emit('cancel-dispute', { sessionId, itemId: item.id, disputerName: myName });
+    dispatch({ type: 'CANCEL_DISPUTE', itemId: item.id });
+  }
+
+  function handleRelease(item, e) {
+    e.stopPropagation();
+    socket.emit('unclaim-item', { sessionId, itemId: item.id, guestName: myName });
+    dispatch({ type: 'UNCLAIM_ITEM', itemId: item.id, guestName: myName });
+  }
+
   const isHost = state.currentUser?.isHost;
 
   function handleDone() {
+    socket.emit('done-claiming', { sessionId, guestName: myName });
     if (isHost) {
       navigate(`/host/${sessionId}`);
     } else {
@@ -80,13 +127,6 @@ export default function ClaimItems() {
 
   return (
     <div className="page">
-      <button
-        className="btn btn-ghost btn-sm"
-        onClick={() => navigate(-1)}
-        style={{ alignSelf: 'flex-start', marginBottom: '8px', padding: '6px 0' }}
-      >
-        ← Back
-      </button>
       <div className="page-header">
         <h2>Hey {myName} 👋</h2>
         <p>Tap the items you ordered</p>
@@ -96,14 +136,25 @@ export default function ClaimItems() {
         {state.items.map((item) => {
           const myClaim = item.claims.find(c => c.guestName === myName);
           const otherClaims = item.claims.filter(c => c.guestName !== myName);
-          const isClaimed = !!myClaim;
+          const isMine = !!myClaim;
+          const isShared = item.claims.some(c => c.splitCount > 1);
+          // Only locked if claimed by someone else AND it's not a shared item
+          const isLocked = !isMine && item.claims.length > 0 && !isShared;
+          const isClaimedByOther = !isMine && item.claims.length > 0;
+          const hasDispute = !!item.dispute;
+          const disputeIsFromMe = hasDispute && item.dispute.by === myName;
+          const disputeIsAboutMe = hasDispute && isMine && item.dispute.by !== myName;
 
           return (
             <div
               key={item.id}
               className="item-row"
               onClick={() => handleClaim(item)}
-              style={{ cursor: 'pointer' }}
+              style={{
+                cursor: isLocked ? 'default' : 'pointer',
+                opacity: isLocked && !hasDispute ? 0.6 : 1,
+                position: 'relative',
+              }}
             >
               <div style={{ flex: 1, minWidth: 0 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
@@ -111,8 +162,8 @@ export default function ClaimItems() {
                     width: '22px',
                     height: '22px',
                     borderRadius: '6px',
-                    border: isClaimed ? 'none' : '2px solid var(--color-border)',
-                    background: isClaimed ? 'var(--color-accent)' : 'transparent',
+                    border: isMine ? 'none' : isLocked ? 'none' : '2px solid var(--color-border)',
+                    background: isMine ? 'var(--color-accent)' : isLocked ? 'var(--color-border)' : isShared && isClaimedByOther ? '#fff3e0' : 'transparent',
                     display: 'flex',
                     alignItems: 'center',
                     justifyContent: 'center',
@@ -122,10 +173,13 @@ export default function ClaimItems() {
                     fontSize: '0.75rem',
                     fontWeight: 700,
                   }}>
-                    {isClaimed && '✓'}
+                    {isMine && '✓'}
+                    {isLocked && '🔒'}
                   </span>
                   <span className="item-name">{item.name}</span>
                 </div>
+
+                {/* Show who claimed it */}
                 {(otherClaims.length > 0 || (myClaim && myClaim.splitCount > 1)) && (
                   <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px', marginTop: '6px', marginLeft: '30px' }}>
                     {myClaim && myClaim.splitCount > 1 && (
@@ -141,6 +195,98 @@ export default function ClaimItems() {
                     ))}
                   </div>
                 )}
+
+                {/* Dispute banner — someone disputes MY claim on this item */}
+                {disputeIsAboutMe && (
+                  <div style={{
+                    marginTop: '8px',
+                    marginLeft: '30px',
+                    padding: '8px 12px',
+                    borderRadius: '8px',
+                    background: '#fff3e0',
+                    border: '1px solid #ffb74d',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '8px',
+                  }}>
+                    <span style={{ fontSize: '0.813rem', fontWeight: 600, color: '#e65100' }}>
+                      {item.dispute.by} says this is theirs
+                    </span>
+                    <button
+                      className="btn btn-sm"
+                      style={{
+                        background: '#fff',
+                        border: '1px solid #ffb74d',
+                        color: '#e65100',
+                        padding: '4px 10px',
+                        fontSize: '0.75rem',
+                        fontWeight: 700,
+                        whiteSpace: 'nowrap',
+                      }}
+                      onClick={(e) => handleRelease(item, e)}
+                    >
+                      Release Item
+                    </button>
+                  </div>
+                )}
+
+                {/* Dispute sent confirmation — I flagged this item, with cancel option */}
+                {disputeIsFromMe && isClaimedByOther && (
+                  <div style={{
+                    marginTop: '8px',
+                    marginLeft: '30px',
+                    padding: '8px 12px',
+                    borderRadius: '8px',
+                    background: '#e3f2fd',
+                    border: '1px solid #90caf9',
+                    display: 'flex',
+                    alignItems: 'center',
+                    justifyContent: 'space-between',
+                    gap: '8px',
+                  }}>
+                    <span style={{ fontSize: '0.813rem', fontWeight: 600, color: '#1565c0' }}>
+                      Waiting for {otherClaims[0]?.guestName} to release
+                    </span>
+                    <button
+                      className="btn btn-sm"
+                      style={{
+                        background: '#fff',
+                        border: '1px solid #90caf9',
+                        color: '#1565c0',
+                        padding: '4px 10px',
+                        fontSize: '0.75rem',
+                        fontWeight: 700,
+                        whiteSpace: 'nowrap',
+                      }}
+                      onClick={(e) => handleCancelDispute(item, e)}
+                    >
+                      Never Mind
+                    </button>
+                  </div>
+                )}
+
+                {/* "This is mine" button for LOCKED items claimed by others (no dispute yet, not shared, not mine) */}
+                {isLocked && !hasDispute && !isMine && (
+                  <button
+                    style={{
+                      marginTop: '8px',
+                      marginLeft: '30px',
+                      padding: '6px 12px',
+                      borderRadius: '8px',
+                      background: 'transparent',
+                      border: '1px dashed var(--color-accent)',
+                      color: 'var(--color-accent)',
+                      fontSize: '0.813rem',
+                      fontWeight: 600,
+                      cursor: 'pointer',
+                      display: 'inline-block',
+                    }}
+                    onClick={(e) => handleDispute(item, e)}
+                  >
+                    This is actually mine
+                  </button>
+                )}
               </div>
               <span className="item-price">{formatPrice(item.price)}</span>
             </div>
@@ -154,15 +300,24 @@ export default function ClaimItems() {
           <span>Your items</span>
           <span className="fw-700">{formatPrice(myTotal.itemsTotal)}</span>
         </div>
+        {myTotal.adminFeeShare > 0 && (
+          <div className="total-row">
+            <span className="text-muted">+ Admin Fee</span>
+            <span>{formatPrice(myTotal.adminFeeShare)}</span>
+          </div>
+        )}
         <div className="total-row">
           <span className="text-muted">+ Tax</span>
           <span>{formatPrice(myTotal.taxShare)}</span>
         </div>
-        <div className="total-row total-row-final">
-          <span>Before tip</span>
-          <span>{formatPrice(myTotal.itemsTotal + myTotal.taxShare)}</span>
+        <div className="total-row">
+          <span className="text-muted">+ Tip {state.tipIncluded ? '(included)' : state.tipMode === 'dollar' ? '(flat)' : `(${state.tipPercent}%)`}</span>
+          <span>{formatPrice(myTotal.tipShare)}</span>
         </div>
-        <p className="text-sm text-muted text-center mt-8">You'll choose your tip next</p>
+        <div className="total-row total-row-final">
+          <span>Your total</span>
+          <span>{formatPrice(myTotal.total)}</span>
+        </div>
       </div>
 
       <div className="spacer" />
@@ -170,6 +325,15 @@ export default function ClaimItems() {
       <button className="btn btn-primary mt-24" onClick={handleDone}>
         I'm Done Claiming
       </button>
+      {isHost && (
+        <button
+          className="btn btn-ghost mt-8"
+          onClick={() => navigate('/review')}
+          style={{ fontSize: '0.875rem' }}
+        >
+          Edit Receipt
+        </button>
+      )}
 
       {/* Split modal */}
       {splitModalItem && (

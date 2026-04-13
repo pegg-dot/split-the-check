@@ -1,4 +1,4 @@
-import { createContext, useContext, useReducer, useCallback } from 'react';
+import { createContext, useContext, useReducer } from 'react';
 
 const SessionContext = createContext(null);
 
@@ -10,12 +10,15 @@ const initialState = {
   // Receipt items from AI
   items: [], // { id, name, price, claims: [{ guestName, splitCount }] }
 
-  // Tax
+  // Tip & tax (host sets tip for the whole table)
   subtotal: 0,
   tax: 0,
-
-  // Per-person tip percentages: { "Sarah": 20, "Alex": 18 }
-  tipPercents: {},
+  tipPercent: 18,
+  tipMode: 'percent',  // 'percent' or 'dollar'
+  tipDollar: 0,        // flat dollar tip amount (when tipMode is 'dollar')
+  tipIncluded: false,  // true if receipt already has gratuity
+  tipAmount: 0,        // pre-included tip amount from receipt
+  adminFee: 0,         // admin/service fee from receipt
 
   // Session
   sessionId: null,
@@ -57,7 +60,19 @@ function sessionReducer(state, action) {
       return { ...state, tax: action.tax };
     }
     case 'SET_TIP_PERCENT': {
-      return { ...state, tipPercents: { ...state.tipPercents, [action.name]: action.percent } };
+      return { ...state, tipPercent: action.percent };
+    }
+    case 'SET_TIP_MODE': {
+      return { ...state, tipMode: action.mode };
+    }
+    case 'SET_TIP_DOLLAR': {
+      return { ...state, tipDollar: action.amount };
+    }
+    case 'SET_TIP_INCLUDED': {
+      return { ...state, tipIncluded: action.tipIncluded, tipAmount: action.tipAmount || 0 };
+    }
+    case 'SET_ADMIN_FEE': {
+      return { ...state, adminFee: action.adminFee };
     }
     case 'SET_SESSION_ID': {
       return { ...state, sessionId: action.sessionId };
@@ -73,15 +88,35 @@ function sessionReducer(state, action) {
       const items = state.items.map(item => {
         if (item.id !== action.itemId) return item;
         const existingClaim = item.claims.find(c => c.guestName === action.guestName);
-        if (existingClaim) return item; // already claimed
-        return { ...item, claims: [...item.claims, { guestName: action.guestName, splitCount: action.splitCount }] };
+        if (existingClaim) return item;
+        const updated = { ...item, claims: [...item.claims, { guestName: action.guestName, splitCount: action.splitCount }] };
+        delete updated.dispute;
+        return updated;
       });
       return { ...state, items };
     }
     case 'UNCLAIM_ITEM': {
       const items = state.items.map(item => {
         if (item.id !== action.itemId) return item;
-        return { ...item, claims: item.claims.filter(c => c.guestName !== action.guestName) };
+        const updated = { ...item, claims: item.claims.filter(c => c.guestName !== action.guestName) };
+        delete updated.dispute;
+        return updated;
+      });
+      return { ...state, items };
+    }
+    case 'DISPUTE_ITEM': {
+      const items = state.items.map(item => {
+        if (item.id !== action.itemId) return item;
+        return { ...item, dispute: { by: action.disputerName } };
+      });
+      return { ...state, items };
+    }
+    case 'CANCEL_DISPUTE': {
+      const items = state.items.map(item => {
+        if (item.id !== action.itemId) return item;
+        const updated = { ...item };
+        delete updated.dispute;
+        return updated;
       });
       return { ...state, items };
     }
@@ -95,7 +130,6 @@ function sessionReducer(state, action) {
       return { ...state, payments: action.payments };
     }
     case 'LOAD_SESSION': {
-      // Hydrate full session from server, preserve currentUser
       const s = action.session;
       return {
         ...state,
@@ -104,20 +138,23 @@ function sessionReducer(state, action) {
         items: s.items,
         subtotal: s.subtotal,
         tax: s.tax,
-        tipPercents: s.tipPercents || {},
+        tipPercent: s.tipPercent ?? 18,
+        tipMode: s.tipMode || 'percent',
+        tipDollar: s.tipDollar || 0,
+        tipIncluded: s.tipIncluded || false,
+        tipAmount: s.tipAmount || 0,
+        adminFee: s.adminFee || 0,
         sessionId: s.id,
         guests: s.guests,
         payments: s.payments || [],
       };
     }
     case 'SYNC_ITEMS': {
-      return { ...state, items: action.items };
+      const subtotal = action.items.reduce((sum, item) => sum + item.price, 0);
+      return { ...state, items: action.items, subtotal };
     }
     case 'SYNC_GUESTS': {
       return { ...state, guests: action.guests };
-    }
-    case 'SYNC_TIP_PERCENTS': {
-      return { ...state, tipPercents: action.tipPercents };
     }
     case 'SYNC_PAYMENTS': {
       return { ...state, payments: action.payments };
@@ -128,10 +165,9 @@ function sessionReducer(state, action) {
 }
 
 // Calculate what a person owes
-export function calculatePersonTotal(state, personName, tipPercent) {
-  const { items, tax, subtotal } = state;
-  const tip = tipPercent ?? state.tipPercents[personName] ?? 18;
-  if (!subtotal || subtotal === 0) return { itemsTotal: 0, taxShare: 0, tipPercent: tip, tipShare: 0, total: 0, claimedItems: [] };
+export function calculatePersonTotal(state, personName) {
+  const { items, tax, subtotal, tipPercent, tipIncluded, tipAmount, adminFee } = state;
+  if (!subtotal || subtotal === 0) return { itemsTotal: 0, taxShare: 0, tipShare: 0, adminFeeShare: 0, total: 0, claimedItems: [], unclaimedItems: [] };
 
   let itemsTotal = 0;
   const claimedItems = [];
@@ -145,17 +181,30 @@ export function calculatePersonTotal(state, personName, tipPercent) {
     }
   }
 
-  // Track unclaimed items separately — don't auto-charge anyone
   const unclaimedItems = items.filter(item => item.claims.length === 0);
 
-  // Tax is proportional to your share of the FULL receipt subtotal
-  // Tip is based on your items only
   const proportion = subtotal > 0 ? itemsTotal / subtotal : 0;
   const taxShare = tax * proportion;
-  const tipShare = itemsTotal * (tip / 100);
-  const total = itemsTotal + taxShare + tipShare;
+  const adminFeeShare = (adminFee || 0) * proportion;
 
-  return { itemsTotal, taxShare, tipPercent: tip, tipShare, total, claimedItems, unclaimedItems };
+  const tipMode = state.tipMode || 'percent';
+  const tipDollar = state.tipDollar || 0;
+
+  // If tip is already included on the receipt, split the fixed tip amount proportionally
+  // If dollar mode, split the flat dollar amount proportionally
+  // Otherwise, calculate tip as a percentage of items
+  let tipShare;
+  if (tipIncluded) {
+    tipShare = (tipAmount || 0) * proportion;
+  } else if (tipMode === 'dollar') {
+    tipShare = Math.max(0, tipDollar) * proportion;
+  } else {
+    tipShare = itemsTotal * (Math.max(0, tipPercent) / 100);
+  }
+
+  const total = itemsTotal + taxShare + tipShare + adminFeeShare;
+
+  return { itemsTotal, taxShare, tipShare, adminFeeShare, total, claimedItems, unclaimedItems };
 }
 
 export function getAllParticipants(state) {

@@ -1,5 +1,6 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
 import { SessionProvider } from './context/SessionContext';
+import QROverlay from './components/QROverlay';
 import Home from './pages/Home';
 import ScanReceipt from './pages/ScanReceipt';
 import ReviewItems from './pages/ReviewItems';
@@ -13,6 +14,7 @@ export default function App() {
   return (
     <SessionProvider>
       <BrowserRouter>
+        <QROverlay />
         <Routes>
           {/* Host flow */}
           <Route path="/" element={<Home />} />

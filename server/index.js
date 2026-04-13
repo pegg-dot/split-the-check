@@ -32,7 +32,7 @@ function createSession(sessionId, hostName, venmoHandle) {
     items: [],
     subtotal: 0,
     tax: 0,
-    tipPercents: {},
+    tipPercent: 18,
     guests: [],
     payments: [],
     createdAt: Date.now(),
@@ -136,59 +136,80 @@ app.post('/api/scan-receipt', async (req, res) => {
     const mediaType = match[1];
     const base64Data = match[2];
 
-    const response = await anthropic.messages.create({
-      model: 'claude-sonnet-4-20250514',
-      max_tokens: 1024,
-      messages: [
-        {
-          role: 'user',
-          content: [
+    // Retry up to 3 times on overloaded errors
+    let lastError;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await anthropic.messages.create({
+          model: 'claude-sonnet-4-20250514',
+          max_tokens: 1024,
+          messages: [
             {
-              type: 'image',
-              source: {
-                type: 'base64',
-                media_type: mediaType,
-                data: base64Data,
-              },
-            },
-            {
-              type: 'text',
-              text: `Extract every line item from this receipt. Return ONLY valid JSON in this exact format, no other text:
+              role: 'user',
+              content: [
+                {
+                  type: 'image',
+                  source: {
+                    type: 'base64',
+                    media_type: mediaType,
+                    data: base64Data,
+                  },
+                },
+                {
+                  type: 'text',
+                  text: `Extract every line item from this receipt. Return ONLY valid JSON in this exact format, no other text:
 
 {
   "items": [
     { "name": "Item Name", "price": 12.99 }
   ],
-  "tax": 0.00
+  "tax": 0.00,
+  "tipIncluded": false,
+  "tipAmount": 0.00,
+  "adminFee": 0.00
 }
 
 Rules:
-- ALWAYS break quantities into individual items. If the receipt says "2x Latte 4.50 = 9.00", return TWO separate entries each with "name": "Latte Macchiato" and "price": 4.50. Never group multiples into one line.
+- ALWAYS break quantities into individual items. If the receipt says "2x Latte 4.50 = 9.00", return TWO separate entries each with "name": "Latte" and "price": 4.50. Never group multiples into one line.
 - "name" is the item description (clean it up if abbreviated)
 - "price" is the per-unit price, NOT the line total
 - "tax" is the tax amount if visible on the receipt, otherwise 0
-- Do NOT include the total line, subtotal line, or tax line as items
-- Do NOT include tip lines as items
+- "tipIncluded" is true if the receipt shows a gratuity/tip/service charge already added
+- "tipAmount" is the tip amount if already included on the receipt, otherwise 0
+- "adminFee" is any admin fee, service fee, or surcharge on the receipt (not tax), otherwise 0
+- Do NOT include the total line, subtotal line, tax line, tip line, or admin/service fee as items
 - Prices should be numbers, not strings`,
+                },
+              ],
             },
           ],
-        },
-      ],
-    });
+        });
 
-    const text = response.content[0].text.trim();
+        const text = response.content[0].text.trim();
 
-    let jsonStr = text;
-    const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
-    if (codeBlockMatch) {
-      jsonStr = codeBlockMatch[1].trim();
+        let jsonStr = text;
+        const codeBlockMatch = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+        if (codeBlockMatch) {
+          jsonStr = codeBlockMatch[1].trim();
+        }
+
+        const data = JSON.parse(jsonStr);
+        return res.json(data);
+      } catch (err) {
+        lastError = err;
+        console.error(`Receipt scan error (attempt ${attempt + 1}):`, err.message);
+        // Only retry on overloaded (529) errors
+        if (err.status === 529 && attempt < 2) {
+          await new Promise(r => setTimeout(r, 2000 * (attempt + 1)));
+          continue;
+        }
+        break;
+      }
     }
-
-    const data = JSON.parse(jsonStr);
-    res.json(data);
+    res.status(500).json({ error: 'Failed to scan receipt. Please try again.' });
   } catch (err) {
     console.error('Receipt scan error:', err.message);
-    res.status(500).json({ error: 'Failed to scan receipt' });
+    res.status(500).json({ error: 'Failed to scan receipt. Please try again.' });
   }
 });
 
@@ -207,7 +228,7 @@ io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
   // Host creates a session
-  socket.on('create-session', ({ sessionId, hostName, venmoHandle, items, subtotal, tax }) => {
+  socket.on('create-session', ({ sessionId, hostName, venmoHandle, items, subtotal, tax, tipPercent, tipMode, tipDollar, tipIncluded, tipAmount, adminFee }) => {
     let session = getSession(sessionId);
     if (!session) {
       session = createSession(sessionId, hostName, venmoHandle);
@@ -215,8 +236,22 @@ io.on('connection', (socket) => {
     session.items = items;
     session.subtotal = subtotal;
     session.tax = tax;
+    if (tipPercent !== undefined) session.tipPercent = tipPercent;
+    session.tipMode = tipMode || 'percent';
+    session.tipDollar = tipDollar || 0;
+    session.tipIncluded = tipIncluded || false;
+    session.tipAmount = tipAmount || 0;
+    session.adminFee = adminFee || 0;
     socket.join(sessionId);
     console.log(`Session ${sessionId} created by ${hostName}`);
+  });
+
+  // Rejoin socket room (for reconnects / page navigations)
+  socket.on('rejoin-room', ({ sessionId }) => {
+    const session = getSession(sessionId);
+    if (session) {
+      socket.join(sessionId);
+    }
   });
 
   // Guest joins a session
@@ -248,10 +283,13 @@ io.on('connection', (socket) => {
     const item = session.items.find(i => i.id === itemId);
     if (!item) return;
 
+    // Don't allow claiming if someone else already claimed it (unless it's a shared/split item)
     const existingClaim = item.claims.find(c => c.guestName === guestName);
     if (existingClaim) return;
 
     item.claims.push({ guestName, splitCount });
+    // Clear any dispute when item is claimed
+    delete item.dispute;
     io.to(sessionId).emit('item-claimed', { itemId, guestName, splitCount, items: session.items });
   });
 
@@ -263,17 +301,61 @@ io.on('connection', (socket) => {
     const item = session.items.find(i => i.id === itemId);
     if (!item) return;
 
+    // If there's an active dispute, auto-assign to the disputer
+    const dispute = item.dispute;
     item.claims = item.claims.filter(c => c.guestName !== guestName);
+
+    if (dispute && dispute.by !== guestName) {
+      // Auto-claim for the disputer
+      item.claims.push({ guestName: dispute.by, splitCount: 1 });
+      delete item.dispute;
+      console.log(`Auto-assigned "${item.name}" to ${dispute.by} after ${guestName} released`);
+    } else {
+      delete item.dispute;
+    }
+
     io.to(sessionId).emit('item-unclaimed', { itemId, guestName, items: session.items });
   });
 
-  // Someone sets their tip
-  socket.on('set-tip', ({ sessionId, name, percent }) => {
+  // Someone disputes another person's claim
+  socket.on('dispute-item', ({ sessionId, itemId, disputerName }) => {
     const session = getSession(sessionId);
     if (!session) return;
 
-    session.tipPercents[name] = percent;
-    io.to(sessionId).emit('tip-updated', { name, percent, tipPercents: session.tipPercents });
+    const item = session.items.find(i => i.id === itemId);
+    if (!item) return;
+
+    item.dispute = { by: disputerName };
+    console.log(`Dispute: ${disputerName} disputes item "${item.name}" in session ${sessionId}`);
+    io.to(sessionId).emit('item-disputed', { itemId, disputerName, items: session.items });
+  });
+
+  // Someone cancels their dispute
+  socket.on('cancel-dispute', ({ sessionId, itemId, disputerName }) => {
+    const session = getSession(sessionId);
+    if (!session) return;
+
+    const item = session.items.find(i => i.id === itemId);
+    if (!item) return;
+
+    // Only the person who filed the dispute can cancel it
+    if (item.dispute && item.dispute.by === disputerName) {
+      delete item.dispute;
+      console.log(`Dispute cancelled: ${disputerName} withdrew dispute on "${item.name}" in session ${sessionId}`);
+      io.to(sessionId).emit('dispute-cancelled', { itemId, items: session.items });
+    }
+  });
+
+  // Guest finished claiming
+  socket.on('done-claiming', ({ sessionId, guestName }) => {
+    const session = getSession(sessionId);
+    if (!session) return;
+
+    if (!session.doneClaiming) session.doneClaiming = [];
+    if (!session.doneClaiming.includes(guestName)) {
+      session.doneClaiming.push(guestName);
+    }
+    io.to(sessionId).emit('claiming-update', { doneClaiming: session.doneClaiming });
   });
 
   // Host marks someone as paid

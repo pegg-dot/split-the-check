@@ -48,6 +48,12 @@ export default function ScanReceipt() {
       if (data.tax) {
         dispatch({ type: 'SET_TAX', tax: data.tax });
       }
+      if (data.adminFee) {
+        dispatch({ type: 'SET_ADMIN_FEE', adminFee: data.adminFee });
+      }
+      if (data.tipIncluded) {
+        dispatch({ type: 'SET_TIP_INCLUDED', tipIncluded: true, tipAmount: data.tipAmount || 0 });
+      }
       navigate('/review');
     } catch (err) {
       setError(err.message);
@@ -58,6 +64,7 @@ export default function ScanReceipt() {
 
   return (
     <div className="page">
+      <button className="btn btn-ghost btn-sm" onClick={() => navigate('/')} style={{ alignSelf: 'flex-start', marginBottom: '8px', padding: '6px 0' }}>← Back to Home</button>
       <div className="page-header">
         <h1>Scan Receipt</h1>
         <p>Take a photo or upload an image of your receipt</p>
