@@ -1,19 +1,47 @@
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import { useSession } from '../context/SessionContext';
-import { socket } from '../context/socket';
+import { socket, BACKEND_URL } from '../context/socket';
 import { QRCodeSVG } from 'qrcode.react';
 
 export default function QROverlay() {
   const { state } = useSession();
   const [open, setOpen] = useState(false);
+  const [sessionUrl, setSessionUrl] = useState('');
 
-  // Only show for hosts who have a session
+  // Build the correct join URL — resolve LAN IP if we're on localhost
+  // so that the QR code works when scanned by phones on the same WiFi.
+  // NOTE: useEffect must come BEFORE any early return (Rules of Hooks).
+  useEffect(() => {
+    if (!state.sessionId) return;
+
+    async function buildUrl() {
+      let origin = window.location.origin;
+      if (
+        window.location.hostname === 'localhost' ||
+        window.location.hostname === '127.0.0.1'
+      ) {
+        try {
+          const res = await fetch(`${BACKEND_URL}/api/server-ip`);
+          const { ip, port } = await res.json();
+          origin = `http://${ip}:${port}`;
+          console.log('[QROverlay] Resolved LAN origin:', origin);
+        } catch (err) {
+          console.warn('[QROverlay] Could not fetch server IP, using window.location.origin:', err);
+        }
+      }
+      const url = `${origin}/session/${state.sessionId}`;
+      console.log('[QROverlay] Session URL:', url);
+      setSessionUrl(url);
+    }
+
+    buildUrl();
+  }, [state.sessionId]);
+
+  // Only render for hosts with an active session
   if (!state.sessionId || !state.currentUser?.isHost) return null;
 
-  const sessionUrl = `${window.location.origin}/session/${state.sessionId}`;
-
   function handleOpen() {
-    // Ensure socket is connected and session exists on server
+    console.log('[QROverlay] Opening QR overlay, sessionUrl:', sessionUrl);
     if (!socket.connected) socket.connect();
     socket.emit('create-session', {
       sessionId: state.sessionId,
@@ -28,11 +56,14 @@ export default function QROverlay() {
       tipIncluded: state.tipIncluded,
       tipAmount: state.tipAmount,
       adminFee: state.adminFee,
+      currency: state.currency,
+      exchangeRate: state.exchangeRate,
     });
     setOpen(true);
   }
 
   async function handleShare() {
+    if (!sessionUrl) return;
     if (navigator.share) {
       try {
         await navigator.share({
@@ -103,7 +134,7 @@ export default function QROverlay() {
       </button>
 
       {/* Full-screen overlay */}
-      {open && (
+      {open && sessionUrl && (
         <div
           style={{
             position: 'fixed',

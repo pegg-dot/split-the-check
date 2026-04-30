@@ -157,28 +157,45 @@ app.post('/api/scan-receipt', async (req, res) => {
                 },
                 {
                   type: 'text',
-                  text: `Extract every line item from this receipt. Return ONLY valid JSON in this exact format, no other text:
+                  text: `Extract line items and charges from this receipt. Return ONLY valid JSON, no other text:
 
 {
-  "items": [
-    { "name": "Item Name", "price": 12.99 }
-  ],
+  "items": [ { "name": "Item Name", "price": 12.99 } ],
   "tax": 0.00,
+  "taxNote": "",
   "tipIncluded": false,
   "tipAmount": 0.00,
-  "adminFee": 0.00
+  "adminFee": 0.00,
+  "currency": "USD"
 }
 
-Rules:
-- ALWAYS break quantities into individual items. If the receipt says "2x Latte 4.50 = 9.00", return TWO separate entries each with "name": "Latte" and "price": 4.50. Never group multiples into one line.
-- "name" is the item description (clean it up if abbreviated)
-- "price" is the per-unit price, NOT the line total
-- "tax" is the tax amount if visible on the receipt, otherwise 0
-- "tipIncluded" is true if the receipt shows a gratuity/tip/service charge already added
-- "tipAmount" is the tip amount if already included on the receipt, otherwise 0
-- "adminFee" is any admin fee, service fee, or surcharge on the receipt (not tax), otherwise 0
-- Do NOT include the total line, subtotal line, tax line, tip line, or admin/service fee as items
-- Prices should be numbers, not strings`,
+ITEMS:
+- If a line has quantity > 1 (e.g. "4 Estrella Galicia 18,00" or "2x Latte 9.00"), return ONE entry: {"name":"Estrella Galicia","price":18.00,"quantity":4,"unitPrice":4.50}. "price" = total for all units. "unitPrice" = price per single unit.
+- If quantity is 1 (or not stated), return {"name":"Latte","price":4.50} — omit quantity/unitPrice.
+- Do NOT include subtotal, tax, tip, service charge, or total lines as items.
+
+TAX HANDLING — this is the most important rule:
+There are two types of receipts:
+
+TYPE 1 — Tax baked into item prices (European: VAT, IVA, MwSt, BTW, incl., inclusive, etc.):
+  The item prices already include tax. The receipt may show a separate "Subtotal" (pre-tax) and a tax line, but the item prices themselves are post-tax.
+  Signs: keywords IVA, VAT, incl., inclusive on the receipt; sum of item prices ≈ receipt TOTAL (not the pre-tax subtotal).
+  Rule: Set "tax" = 0 and "taxNote" = "Tax included in item prices" (do NOT add it separately — it's already in the prices shown).
+
+TYPE 2 — Tax added on top (US, Canada: Sales Tax, GST, HST):
+  Item prices are pre-tax. Tax is a separate line that gets added to the subtotal.
+  Signs: items sum ≈ Subtotal; tax line adds to reach Total.
+  Rule: Set "tax" = the tax amount shown on the receipt.
+
+DEFAULT to TYPE 2 (tax added on top) unless there is clear evidence of TYPE 1.
+
+OTHER CHARGES:
+- "adminFee" = service charge / admin fee / surcharge added on top of items (labels: Service Charge, S/C, SC, Service Fee, Admin Fee, Gratuity, Auto-Gratuity, Couvert, Propina). 0 if none.
+- "tipIncluded" = true only if a discretionary tip/gratuity line is already on the bill.
+- "tipAmount" = that pre-added tip amount. Do NOT double-count in both adminFee and tipAmount.
+- "currency" = ISO code from the symbol: "USD" $, "EUR" €, "GBP" £, "JPY" ¥, "CAD" C$, "AUD" A$, "MXN" for Mexican peso. Default "USD".
+
+FINAL CHECK: sum(items) + tax + adminFee + tipAmount must equal the receipt's printed TOTAL exactly (within rounding). If it doesn't, recheck your tax categorization.`,
                 },
               ],
             },
@@ -194,6 +211,26 @@ Rules:
         }
 
         const data = JSON.parse(jsonStr);
+
+        // If non-USD currency detected, fetch exchange rate to USD
+        const currency = (data.currency || 'USD').toUpperCase();
+        let exchangeRate = 1;
+        if (currency !== 'USD') {
+          try {
+            const rateRes = await fetch(`https://open.er-api.com/v6/latest/${currency}`);
+            const rateData = await rateRes.json();
+            if (rateData && rateData.rates && rateData.rates.USD) {
+              exchangeRate = rateData.rates.USD;
+            }
+          } catch (e) {
+            console.error('Exchange rate fetch failed, using fallback:', e.message);
+            // Fallback static rates (approximate, updated 2026)
+            const fallback = { EUR: 1.09, GBP: 1.27, JPY: 0.0067, CAD: 0.74, AUD: 0.66, CHF: 1.13, CNY: 0.14, INR: 0.012, MXN: 0.058 };
+            exchangeRate = fallback[currency] || 1;
+          }
+        }
+        data.currency = currency;
+        data.exchangeRate = exchangeRate;
         return res.json(data);
       } catch (err) {
         lastError = err;
@@ -213,6 +250,21 @@ Rules:
   }
 });
 
+// Return the server's LAN IP so clients can build mobile-friendly URLs
+const os = require('os');
+function getLanIP() {
+  const interfaces = os.networkInterfaces();
+  for (const name of Object.keys(interfaces)) {
+    for (const iface of (interfaces[name] || [])) {
+      if (iface.family === 'IPv4' && !iface.internal) return iface.address;
+    }
+  }
+  return 'localhost';
+}
+app.get('/api/server-ip', (req, res) => {
+  res.json({ ip: getLanIP(), port: 5173 });
+});
+
 // Get session data (for initial load)
 app.get('/api/session/:sessionId', (req, res) => {
   const session = getSession(req.params.sessionId);
@@ -228,7 +280,7 @@ io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
   // Host creates a session
-  socket.on('create-session', ({ sessionId, hostName, venmoHandle, items, subtotal, tax, tipPercent, tipMode, tipDollar, tipIncluded, tipAmount, adminFee }) => {
+  socket.on('create-session', ({ sessionId, hostName, venmoHandle, items, subtotal, tax, tipPercent, tipMode, tipDollar, tipIncluded, tipAmount, adminFee, currency, exchangeRate }) => {
     let session = getSession(sessionId);
     if (!session) {
       session = createSession(sessionId, hostName, venmoHandle);
@@ -242,6 +294,8 @@ io.on('connection', (socket) => {
     session.tipIncluded = tipIncluded || false;
     session.tipAmount = tipAmount || 0;
     session.adminFee = adminFee || 0;
+    session.currency = currency || 'USD';
+    session.exchangeRate = exchangeRate || 1;
     socket.join(sessionId);
     console.log(`Session ${sessionId} created by ${hostName}`);
   });
@@ -346,6 +400,65 @@ io.on('connection', (socket) => {
     }
   });
 
+  // Guest shares an already-claimed item — updates all existing claimers' splitCount
+  socket.on('share-item', ({ sessionId, itemId, guestName, splitCount }) => {
+    const session = getSession(sessionId);
+    if (!session) return;
+
+    const item = session.items.find(i => i.id === itemId);
+    if (!item) return;
+
+    // Guard: person already claimed this item
+    if (item.claims.some(c => c.guestName === guestName)) return;
+
+    // Minimum splitCount = existing claimers + 1
+    const minCount = item.claims.length + 1;
+    const finalCount = Math.max(minCount, splitCount);
+
+    // Update every existing claim to the new splitCount
+    item.claims = item.claims.map(c => ({ ...c, splitCount: finalCount }));
+    // Add this person's claim
+    item.claims.push({ guestName, splitCount: finalCount });
+    // Clear any pending dispute
+    delete item.dispute;
+
+    console.log(`${guestName} shared "${item.name}" (${finalCount} ways) in session ${sessionId}`);
+    io.to(sessionId).emit('item-claimed', { items: session.items });
+  });
+
+  // Claim N units from a quantity item (quantity > 1)
+  socket.on('claim-units', ({ sessionId, itemId, guestName, units }) => {
+    const session = getSession(sessionId);
+    if (!session) return;
+    const item = session.items.find(i => i.id === itemId);
+    if (!item || (item.quantity || 1) <= 1) return;
+
+    const totalClaimed = item.claims.reduce((sum, c) => sum + (c.units || 0), 0);
+    const available    = item.quantity - totalClaimed;
+    const actualUnits  = Math.min(Math.max(1, units), available);
+    if (actualUnits <= 0) return;
+
+    const existing = item.claims.find(c => c.guestName === guestName);
+    if (existing) {
+      existing.units = (existing.units || 0) + actualUnits;
+    } else {
+      item.claims.push({ guestName, units: actualUnits });
+    }
+    delete item.dispute;
+    console.log(`${guestName} claimed ${actualUnits} units of "${item.name}" in session ${sessionId}`);
+    io.to(sessionId).emit('item-claimed', { items: session.items });
+  });
+
+  // Release a guest's unit claim
+  socket.on('unclaim-units', ({ sessionId, itemId, guestName }) => {
+    const session = getSession(sessionId);
+    if (!session) return;
+    const item = session.items.find(i => i.id === itemId);
+    if (!item) return;
+    item.claims = item.claims.filter(c => c.guestName !== guestName);
+    io.to(sessionId).emit('item-unclaimed', { items: session.items });
+  });
+
   // Guest finished claiming
   socket.on('done-claiming', ({ sessionId, guestName }) => {
     const session = getSession(sessionId);
@@ -377,6 +490,17 @@ io.on('connection', (socket) => {
   });
 });
 
+// In production, serve the built React app from Express so everything
+// runs on a single URL (no CORS, no proxy, socket.io just works).
+if (process.env.NODE_ENV === 'production') {
+  const clientDist = path.join(__dirname, '../client/dist');
+  app.use(express.static(clientDist));
+  // Send index.html for any route not matched by the API (client-side routing)
+  app.get('*', (req, res) => {
+    res.sendFile(path.join(clientDist, 'index.html'));
+  });
+}
+
 server.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+  console.log(`Server running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
 });

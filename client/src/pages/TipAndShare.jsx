@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useSession } from '../context/SessionContext';
+import { useSession, formatPrice as fmtPrice, currencySymbol, round2 } from '../context/SessionContext';
 import { socket } from '../context/socket';
 
 const TIP_PRESETS = [15, 18, 20];
@@ -12,18 +12,30 @@ export default function TipAndShare() {
   const [isCustom, setIsCustom] = useState(false);
   const [dollarInput, setDollarInput] = useState(state.tipDollar > 0 ? state.tipDollar.toFixed(2) : '');
 
+  console.log('[TipAndShare] Mounted. state:', { subtotal: state.subtotal, tax: state.tax, tipPercent: state.tipPercent, tipIncluded: state.tipIncluded, tipAmount: state.tipAmount, sessionId: state.sessionId, items: state.items?.length });
+
   const tipMode = state.tipMode || 'percent';
 
-  // Calculate the actual tip amount for display (always based on subtotal, pre-tax)
-  let tipAmount;
-  if (state.tipIncluded) {
-    tipAmount = state.tipAmount || 0;
-  } else if (tipMode === 'dollar') {
-    tipAmount = Math.max(0, state.tipDollar || 0);
+  // The gratuity already printed on the receipt (never changes based on host selection)
+  const includedGratuity = state.tipIncluded ? round2(Math.max(0, state.tipAmount || 0)) : 0;
+
+  // The ADDITIONAL tip the host is choosing to add on top (or the only tip if no gratuity)
+  let additionalTip;
+  if (tipMode === 'dollar') {
+    additionalTip = round2(Math.max(0, state.tipDollar || 0));
   } else {
-    tipAmount = state.subtotal * (Math.max(0, state.tipPercent) / 100);
+    additionalTip = round2(Math.max(0, state.subtotal * (Math.max(0, state.tipPercent || 0) / 100)));
   }
-  const grandTotal = state.subtotal + state.tax + (state.adminFee || 0) + tipAmount;
+
+  const grandTotal = round2(
+    Math.max(0, state.subtotal) +
+    Math.max(0, state.tax) +
+    Math.max(0, state.adminFee || 0) +
+    includedGratuity +
+    additionalTip
+  );
+
+  console.log('[TipAndShare] Calculated:', { includedGratuity, additionalTip, grandTotal });
 
   // Generate session ID if not set
   useEffect(() => {
@@ -55,6 +67,8 @@ export default function TipAndShare() {
       tipIncluded: state.tipIncluded,
       tipAmount: state.tipAmount,
       adminFee: state.adminFee,
+      currency: state.currency,
+      exchangeRate: state.exchangeRate,
     });
   }, [sessionId, state.tipPercent, state.tipMode, state.tipDollar, state.tipIncluded]);
 
@@ -66,21 +80,15 @@ export default function TipAndShare() {
   function handleCustomTip(val) {
     setCustomTip(val);
     const parsed = parseFloat(val);
-    if (!isNaN(parsed) && parsed >= 0) {
-      dispatch({ type: 'SET_TIP_PERCENT', percent: parsed });
-    } else if (val === '' || val === '-') {
-      dispatch({ type: 'SET_TIP_PERCENT', percent: 0 });
-    }
+    const safe = isNaN(parsed) ? 0 : Math.max(0, parsed);
+    dispatch({ type: 'SET_TIP_PERCENT', percent: safe });
   }
 
   function handleDollarTip(val) {
     setDollarInput(val);
     const parsed = parseFloat(val);
-    if (!isNaN(parsed) && parsed >= 0) {
-      dispatch({ type: 'SET_TIP_DOLLAR', amount: parsed });
-    } else if (val === '' || val === '-') {
-      dispatch({ type: 'SET_TIP_DOLLAR', amount: 0 });
-    }
+    const safe = isNaN(parsed) ? 0 : round2(Math.max(0, parsed));
+    dispatch({ type: 'SET_TIP_DOLLAR', amount: safe });
   }
 
   function setTipMode(mode) {
@@ -92,7 +100,8 @@ export default function TipAndShare() {
     dispatch({ type: 'SET_TIP_INCLUDED', tipIncluded: newValue, tipAmount: state.tipAmount });
   }
 
-  const formatPrice = (p) => `$${p.toFixed(2)}`;
+  const formatPrice = (p) => fmtPrice(p, state.currency || 'USD');
+  const curSym = currencySymbol(state.currency || 'USD');
 
   return (
     <div className="page">
@@ -102,50 +111,23 @@ export default function TipAndShare() {
         <p>Set the tip for the table</p>
       </div>
 
-      {/* Tip included toggle */}
-      <div
-        onClick={toggleTipIncluded}
-        style={{
-          display: 'flex',
-          alignItems: 'center',
-          justifyContent: 'space-between',
+      {/* Gratuity-detected banner */}
+      {state.tipIncluded && state.tipAmount > 0 && (
+        <div style={{
           padding: '14px 16px',
           borderRadius: 'var(--radius-lg)',
-          border: '1.5px solid var(--color-border)',
+          background: '#e3f2fd',
+          border: '1.5px solid #90caf9',
           marginBottom: '16px',
-          cursor: 'pointer',
-          background: state.tipIncluded ? '#e8f5e9' : 'var(--color-surface)',
-          transition: 'all 0.15s ease',
-        }}
-      >
-        <div>
-          <span style={{ fontWeight: 700, fontSize: '0.938rem' }}>Tip already on the bill?</span>
-          <p style={{ fontSize: '0.75rem', color: 'var(--color-text-muted)', marginTop: '2px' }}>
-            Toggle if gratuity was already added
+        }}>
+          <p style={{ fontWeight: 700, fontSize: '0.938rem', color: '#1565c0' }}>
+            🔍 A gratuity of {formatPrice(state.tipAmount)} was detected on your receipt
+          </p>
+          <p style={{ fontSize: '0.813rem', color: '#1976d2', marginTop: '4px' }}>
+            It's already included in the total. Would you like to add an additional tip?
           </p>
         </div>
-        <div style={{
-          width: '48px',
-          height: '28px',
-          borderRadius: '14px',
-          background: state.tipIncluded ? 'var(--color-accent)' : 'var(--color-border)',
-          position: 'relative',
-          transition: 'background 0.2s ease',
-          flexShrink: 0,
-        }}>
-          <div style={{
-            width: '22px',
-            height: '22px',
-            borderRadius: '50%',
-            background: '#fff',
-            position: 'absolute',
-            top: '3px',
-            left: state.tipIncluded ? '23px' : '3px',
-            transition: 'left 0.2s ease',
-            boxShadow: '0 1px 3px rgba(0,0,0,0.2)',
-          }} />
-        </div>
-      </div>
+      )}
 
       {/* Bill summary */}
       <div className="card mb-24">
@@ -163,25 +145,31 @@ export default function TipAndShare() {
           <span>Tax</span>
           <span className="fw-700">{formatPrice(state.tax)}</span>
         </div>
-        <div className="total-row">
-          <span>
-            {state.tipIncluded
-              ? 'Tip (included)'
-              : tipMode === 'dollar'
-                ? 'Tip (flat)'
-                : `Tip (${state.tipPercent}%)`
-            }
-          </span>
-          <span className="fw-700">{formatPrice(tipAmount)}</span>
-        </div>
+        {includedGratuity > 0 && (
+          <div className="total-row">
+            <span>Gratuity (included)</span>
+            <span className="fw-700">{formatPrice(includedGratuity)}</span>
+          </div>
+        )}
+        {additionalTip > 0 && (
+          <div className="total-row">
+            <span>
+              {state.tipIncluded
+                ? tipMode === 'dollar' ? 'Additional tip (flat)' : `Additional tip (${state.tipPercent}%)`
+                : tipMode === 'dollar' ? 'Tip (flat)' : `Tip (${state.tipPercent}%)`
+              }
+            </span>
+            <span className="fw-700">{formatPrice(additionalTip)}</span>
+          </div>
+        )}
         <div className="total-row total-row-final">
           <span>Total</span>
           <span>{formatPrice(grandTotal)}</span>
         </div>
       </div>
 
-      {/* Tip selector — only show if tip is NOT already included */}
-      {!state.tipIncluded && (
+      {/* Tip selector — always shown; if gratuity detected, framed as "additional tip" */}
+      {(
         <>
           {/* Mode toggle: % vs $ */}
           <div style={{
@@ -222,7 +210,7 @@ export default function TipAndShare() {
                 transition: 'all 0.15s ease',
               }}
             >
-              Dollar $
+              Flat {curSym}
             </button>
           </div>
 
@@ -233,6 +221,12 @@ export default function TipAndShare() {
           {tipMode === 'percent' && (
             <>
               <div className="tip-options mb-16">
+                <button
+                  className={`tip-btn ${!isCustom && state.tipPercent === 0 ? 'active' : ''}`}
+                  onClick={() => selectTip(0)}
+                >
+                  <span>No tip</span>
+                </button>
                 {TIP_PRESETS.map((pct) => (
                   <button
                     key={pct}
@@ -263,7 +257,7 @@ export default function TipAndShare() {
                       min="0"
                       value={customTip}
                       onChange={(e) => handleCustomTip(e.target.value)}
-                      onBlur={() => { if (customTip === '' || parseFloat(customTip) < 0) setCustomTip('0'); }}
+                      onBlur={() => { const v = parseFloat(customTip); if (isNaN(v) || v < 0) { setCustomTip('0'); dispatch({ type: 'SET_TIP_PERCENT', percent: 0 }); } }}
                       placeholder="Enter tip %"
                       autoFocus
                     />
@@ -278,7 +272,7 @@ export default function TipAndShare() {
             <div className="input-group">
               <label className="input-label">Tip amount</label>
               <div style={{ position: 'relative' }}>
-                <span style={{ position: 'absolute', left: '16px', top: '50%', transform: 'translateY(-50%)', color: 'var(--color-text-muted)', fontWeight: 600 }}>$</span>
+                <span style={{ position: 'absolute', left: '16px', top: '50%', transform: 'translateY(-50%)', color: 'var(--color-text-muted)', fontWeight: 600 }}>{curSym}</span>
                 <input
                   className="input"
                   type="number"
@@ -286,15 +280,15 @@ export default function TipAndShare() {
                   min="0"
                   value={dollarInput}
                   onChange={(e) => handleDollarTip(e.target.value)}
-                  onBlur={() => { if (dollarInput === '' || parseFloat(dollarInput) < 0) setDollarInput('0'); }}
+                  onBlur={() => { const v = parseFloat(dollarInput); if (isNaN(v) || v < 0) { setDollarInput('0.00'); dispatch({ type: 'SET_TIP_DOLLAR', amount: 0 }); } }}
                   placeholder="0.00"
                   style={{ paddingLeft: '32px' }}
                   autoFocus
                 />
               </div>
-              {state.subtotal > 0 && tipAmount > 0 && (
+              {state.subtotal > 0 && additionalTip > 0 && (
                 <p className="text-sm text-muted mt-8">
-                  Tip: {((tipAmount / state.subtotal) * 100).toFixed(1)}%
+                  Tip: {((additionalTip / state.subtotal) * 100).toFixed(1)}%
                 </p>
               )}
             </div>
@@ -305,7 +299,9 @@ export default function TipAndShare() {
 
       {state.tipIncluded && (
         <p className="text-sm text-muted text-center">
-          Tip is already on the receipt — it will be split proportionally
+          {state.tipPercent === 0 && !state.tipDollar
+            ? 'No additional tip will be added.'
+            : 'Additional tip will be added on top of the detected gratuity.'}
         </p>
       )}
 

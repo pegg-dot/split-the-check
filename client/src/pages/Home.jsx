@@ -1,14 +1,27 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useSession } from '../context/SessionContext';
+import { BACKEND_URL } from '../context/socket';
 
 export default function Home() {
   const navigate = useNavigate();
   const { dispatch } = useSession();
   const [name, setName] = useState('');
   const [venmo, setVenmo] = useState('');
+  const [currency, setCurrency] = useState('USD');
   const [verifying, setVerifying] = useState(false);
   const [venmoStatus, setVenmoStatus] = useState(null); // { valid, displayName, note, error }
+
+  const CURRENCIES = [
+    { code: 'USD', label: 'USD — US Dollar ($)' },
+    { code: 'EUR', label: 'EUR — Euro (€)' },
+    { code: 'GBP', label: 'GBP — British Pound (£)' },
+    { code: 'MXN', label: 'MXN — Mexican Peso (MX$)' },
+    { code: 'CAD', label: 'CAD — Canadian Dollar (C$)' },
+    { code: 'AUD', label: 'AUD — Australian Dollar (A$)' },
+    { code: 'JPY', label: 'JPY — Japanese Yen (¥)' },
+    { code: 'CHF', label: 'CHF — Swiss Franc (CHF)' },
+  ];
 
   const canStart = name.trim() && venmo.trim() && venmoStatus?.valid;
 
@@ -20,7 +33,7 @@ export default function Home() {
     setVerifying(true);
     setVenmoStatus(null);
     try {
-      const res = await fetch('/api/verify-venmo', {
+      const res = await fetch(`${BACKEND_URL}/api/verify-venmo`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ handle: handle.trim() }),
@@ -50,6 +63,7 @@ export default function Home() {
     e.preventDefault();
     if (!canStart) return;
     dispatch({ type: 'SET_HOST', name: name.trim(), venmoHandle: venmo.trim() });
+    dispatch({ type: 'SET_CURRENCY', currency, exchangeRate: 1 }); // rate fetched after scan
     navigate('/scan');
   }
 
@@ -137,6 +151,23 @@ export default function Home() {
               This is where your friends will send payment
             </p>
           )}
+        </div>
+
+        <div className="input-group">
+          <label className="input-label">Receipt currency</label>
+          <select
+            className="input"
+            value={currency}
+            onChange={(e) => setCurrency(e.target.value)}
+            style={{ appearance: 'auto' }}
+          >
+            {CURRENCIES.map(c => (
+              <option key={c.code} value={c.code}>{c.label}</option>
+            ))}
+          </select>
+          <p className="text-sm text-muted mt-8">
+            The AI will auto-detect this from your receipt too
+          </p>
         </div>
 
         <button type="submit" className="btn btn-primary mt-16" disabled={!canStart || verifying}>

@@ -1,7 +1,7 @@
 import { useState, useMemo, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useSession, calculatePersonTotal, getAllParticipants } from '../context/SessionContext';
-import { socket } from '../context/socket';
+import { useSession, calculateAllPersonTotals, getAllParticipants, formatPrice as fmtPrice, round2 } from '../context/SessionContext';
+import { socket, BACKEND_URL } from '../context/socket';
 
 export default function HostDashboard() {
   const { sessionId } = useParams();
@@ -9,7 +9,7 @@ export default function HostDashboard() {
   const { state, dispatch } = useSession();
   const [doneClaiming, setDoneClaiming] = useState([]);
 
-  const formatPrice = (p) => `$${p.toFixed(2)}`;
+  const formatPrice = (p) => fmtPrice(p, state.currency || 'USD');
 
   // Fetch latest session state on mount + listen for real-time updates
   useEffect(() => {
@@ -17,12 +17,14 @@ export default function HostDashboard() {
     socket.emit('rejoin-room', { sessionId });
 
     // Fetch fresh state via REST in case we missed socket events
-    fetch(`/api/session/${sessionId}`)
+    fetch(`${BACKEND_URL}/api/session/${sessionId}`)
       .then(r => r.ok ? r.json() : null)
       .then(session => {
         if (session) {
           dispatch({ type: 'LOAD_SESSION', session });
           if (session.doneClaiming) setDoneClaiming(session.doneClaiming);
+          // Ensure currentUser is set as host (important on fresh mobile load)
+          dispatch({ type: 'SET_HOST', name: session.hostName, venmoHandle: session.venmoHandle });
         }
       })
       .catch(() => {});
@@ -59,41 +61,35 @@ export default function HostDashboard() {
     };
   }, [dispatch, sessionId]);
 
-  // Build data for all participants including host
+  // Build data for all participants using exact cent distribution (no rounding drift)
   const everyone = useMemo(() => {
-    const all = getAllParticipants(state);
-    return all.map(name => {
-      const totals = calculatePersonTotal(state, name);
+    const allTotals = calculateAllPersonTotals(state);
+    return getAllParticipants(state).map(name => {
+      const totals  = allTotals[name] || {};
       const payment = state.payments.find(p => p.guestName === name);
-      const claimedItems = state.items
-        .filter(item => item.claims.some(c => c.guestName === name))
-        .map(item => {
-          const claim = item.claims.find(c => c.guestName === name);
-          return {
-            name: item.name,
-            price: item.price,
-            myShare: item.price / claim.splitCount,
-            splitCount: claim.splitCount,
-          };
-        });
       return {
         name,
-        isHost: name === state.hostName,
-        total: totals.total,
-        itemsTotal: totals.itemsTotal,
-        taxShare: totals.taxShare,
-        tipShare: totals.tipShare,
+        isHost:       name === state.hostName,
+        total:        totals.total        || 0,
+        itemsTotal:   totals.itemsTotal   || 0,
+        taxShare:     totals.taxShare     || 0,
+        tipShare:     totals.tipShare     || 0,
         adminFeeShare: totals.adminFeeShare || 0,
-        paid: name === state.hostName ? true : (payment?.paid || false),
-        claimedItems,
+        paid:         name === state.hostName ? true : (payment?.paid || false),
+        claimedItems: (totals.claimedItems || []).map(item => ({
+          name:       item.name,
+          price:      item.price,
+          myShare:    item.myShare,
+          splitCount: item.claims?.find(c => c.guestName === name)?.splitCount || 1,
+        })),
       };
     });
   }, [state]);
 
   const guests = everyone.filter(p => !p.isHost);
   const hostData = everyone.find(p => p.isHost);
-  const totalCollected = guests.filter(p => p.paid).reduce((sum, p) => sum + p.total, 0);
-  const totalExpected = guests.reduce((sum, p) => sum + p.total, 0);
+  const totalCollected = round2(guests.filter(p => p.paid).reduce((sum, p) => round2(sum + p.total), 0));
+  const totalExpected = round2(guests.reduce((sum, p) => round2(sum + p.total), 0));
   const fullyUnclaimed = state.items.filter(item => item.claims.length === 0);
   const partiallyClaimed = state.items.filter(item => {
     if (item.claims.length === 0) return false;
@@ -256,7 +252,7 @@ export default function HostDashboard() {
                   opacity: 0.7,
                 }}>
                   <span>Tax{person.adminFeeShare > 0 ? ' + Fee' : ''} + Tip {state.tipIncluded ? '(incl.)' : state.tipMode === 'dollar' ? '(flat)' : `(${state.tipPercent}%)`}</span>
-                  <span style={{ fontFamily: 'monospace' }}>{formatPrice(person.taxShare + person.tipShare + (person.adminFeeShare || 0))}</span>
+                  <span style={{ fontFamily: 'monospace' }}>{formatPrice(round2(person.taxShare + person.tipShare + (person.adminFeeShare || 0)))}</span>
                 </div>
               </div>
             ) : (
@@ -299,7 +295,7 @@ export default function HostDashboard() {
             Bill Total
           </span>
           <span style={{ fontWeight: 800, fontSize: '1.25rem', fontFamily: 'monospace' }}>
-            {formatPrice(everyone.reduce((sum, p) => sum + p.total, 0))}
+            {formatPrice(round2(everyone.reduce((sum, p) => round2(sum + p.total), 0)))}
           </span>
         </div>
         {hostData && hostData.total > 0 && (
