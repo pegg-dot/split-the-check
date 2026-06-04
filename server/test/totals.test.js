@@ -1,6 +1,26 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { round2, distributeProportionally, calculateAllPersonTotals, calculateUnaccounted } = require('../lib/totals');
+const { round2, distributeProportionally, calculateAllPersonTotals, calculateUnaccounted, hasOutstandingBalance } = require('../lib/totals');
+
+test('hasOutstandingBalance: true when a guest who owes has not paid', () => {
+  const session = {
+    hostName: 'Host', guests: [{ name: 'A' }],
+    subtotal: 20, tax: 0, tipPercent: 0, payments: [],
+    items: [{ id: 0, name: 'X', price: 20, claims: [{ guestName: 'A', splitCount: 1 }] }],
+  };
+  assert.strictEqual(hasOutstandingBalance(session), true);
+  session.payments = [{ guestName: 'A', status: 'paid' }];
+  assert.strictEqual(hasOutstandingBalance(session), false);
+});
+
+test('hasOutstandingBalance: false when only the host has items', () => {
+  const session = {
+    hostName: 'Host', guests: [],
+    subtotal: 20, tax: 0, tipPercent: 0, payments: [],
+    items: [{ id: 0, name: 'X', price: 20, claims: [{ guestName: 'Host', splitCount: 1 }] }],
+  };
+  assert.strictEqual(hasOutstandingBalance(session), false);
+});
 
 test('round2 eliminates float drift', () => {
   assert.strictEqual(round2(0.1 + 0.2), 0.3);

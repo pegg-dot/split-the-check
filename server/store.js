@@ -118,15 +118,26 @@ function allSessions() {
   return Array.from(cache.values());
 }
 
-/** Remove sessions whose last activity is older than the TTL. Returns count. */
-function pruneExpired(now = Date.now()) {
+// Hard ceiling — even a session with money owed is dropped after this, so the
+// store can't grow forever from abandoned tabs.
+const HARD_MAX_AGE_MS = Number(process.env.SESSION_HARD_MAX_MS) || 7 * 24 * 60 * 60 * 1000; // 7d
+
+/**
+ * Remove sessions older than the TTL. An optional `shouldKeep(session)` predicate
+ * can extend a session's life past the TTL (e.g. it still has an unpaid balance)
+ * up to HARD_MAX_AGE_MS. Returns the number removed.
+ */
+function pruneExpired(now = Date.now(), shouldKeep = null) {
   let removed = 0;
   for (const [id, session] of cache) {
     const last = session.updatedAt || session.createdAt || 0;
-    if (now - last > SESSION_TTL_MS) {
-      cache.delete(id);
-      removed++;
+    const age = now - last;
+    if (age <= SESSION_TTL_MS) continue;
+    if (age < HARD_MAX_AGE_MS && typeof shouldKeep === 'function') {
+      try { if (shouldKeep(session)) continue; } catch { /* fall through to delete */ }
     }
+    cache.delete(id);
+    removed++;
   }
   if (removed > 0) scheduleWrite();
   return removed;

@@ -34,6 +34,7 @@ export default function ClaimItems() {
 
     function onSyncItems({ items }) { dispatch({ type: 'SYNC_ITEMS', items }); }
     function onGuestJoined({ guests }) { dispatch({ type: 'SYNC_GUESTS', guests }); }
+    function onSessionUpdated(session) { if (session) dispatch({ type: 'LOAD_SESSION', session }); }
     function onReconnect() { socket.emit('rejoin-room', identity); }
 
     socket.on('item-claimed',      onSyncItems);
@@ -41,6 +42,7 @@ export default function ClaimItems() {
     socket.on('item-disputed',     onSyncItems);
     socket.on('dispute-cancelled', onSyncItems);
     socket.on('guest-joined',      onGuestJoined);
+    socket.on('session-updated',   onSessionUpdated);
     socket.on('connect',           onReconnect);
 
     return () => {
@@ -49,6 +51,7 @@ export default function ClaimItems() {
       socket.off('item-disputed',     onSyncItems);
       socket.off('dispute-cancelled', onSyncItems);
       socket.off('guest-joined',      onGuestJoined);
+      socket.off('session-updated',   onSessionUpdated);
       socket.off('connect',           onReconnect);
     };
   }, [dispatch, sessionId]);
@@ -143,6 +146,21 @@ export default function ClaimItems() {
   }
 
   const myTotal = calculatePersonTotal(state, myName);
+
+  // Joined before the host finished setting up — wait and fill in live.
+  if (state.items.length === 0) {
+    return (
+      <div className="page" style={{ justifyContent: 'center' }}>
+        <div className="text-center">
+          <div className="spinner spinner-lg" style={{ margin: '0 auto 16px' }} />
+          <h2>Hang tight, {myName} 👋</h2>
+          <p className="text-muted mt-8">
+            {state.hostName || 'The host'} is still adding items. This screen updates automatically.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   // ── Render ─────────────────────────────────────────────────────────
   return (

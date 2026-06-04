@@ -10,6 +10,7 @@ const store = require('./store');
 const { createRateLimiter } = require('./lib/rate-limit');
 const { sanitizeScan } = require('./lib/sanitize');
 const { sendEmail, notifyEnabled } = require('./lib/notify');
+const { calculateAllPersonTotals, hasOutstandingBalance } = require('./lib/totals');
 
 const app = express();
 const server = http.createServer(app);
@@ -33,8 +34,10 @@ const anthropic = new Anthropic.default({
 store.load();
 
 // Periodic prune of expired sessions (TTL is refreshed on every activity).
+// Keep a session past its TTL while it still has an unpaid balance — never
+// auto-delete a tab where money is owed (up to the store's hard cap).
 const prune = setInterval(() => {
-  const removed = store.pruneExpired();
+  const removed = store.pruneExpired(Date.now(), hasOutstandingBalance);
   if (removed > 0) console.log(`[store] pruned ${removed} expired session(s)`);
 }, 5 * 60 * 1000);
 if (prune.unref) prune.unref();
@@ -368,6 +371,9 @@ io.on('connection', (socket) => {
     store.saveSession(session);
     socket.join(sessionId);
     socketMeta.set(socket.id, { sessionId, name: hostName, isHost: true });
+    // Push the latest receipt/tip/items to anyone already in the room so guests
+    // who joined early (or before a tip change) re-sync automatically.
+    socket.to(sessionId).emit('session-updated', session);
     console.log(`Session ${sessionId} created by ${hostName}`);
   });
 
@@ -633,6 +639,82 @@ io.on('connection', (socket) => {
     io.to(sessionId).emit('payment-updated', { guestName: target, payments: session.payments });
   });
 
+  // Host resolves a dispute by assigning the item to a specific person
+  // (breaks deadlocks where the current claimer won't release).
+  socket.on('resolve-dispute', ({ sessionId, itemId, assignTo }) => {
+    const session = getSession(sessionId);
+    if (!session) return;
+    const meta = socketMeta.get(socket.id);
+    if (!meta || !meta.isHost) return; // host-only
+    const item = session.items.find(i => i.id === itemId);
+    if (!item) return;
+    if (!Array.isArray(item.claims)) item.claims = [];
+    delete item.dispute;
+    if (assignTo) {
+      item.claims = [{ guestName: assignTo, splitCount: 1 }]; // sole owner
+    }
+    store.saveSession(session);
+    io.to(sessionId).emit('item-claimed', { items: session.items });
+  });
+
+  // Host one-tap resolves the unclaimed remainder so nothing falls through.
+  // mode: 'me' (host takes all unclaimed) | 'split' (even split among everyone).
+  socket.on('resolve-leftover', ({ sessionId, mode }) => {
+    const session = getSession(sessionId);
+    if (!session) return;
+    const meta = socketMeta.get(socket.id);
+    if (!meta || !meta.isHost) return; // host-only
+    const participants = [session.hostName, ...session.guests.map(g => g.name)].filter(Boolean);
+
+    for (const item of session.items) {
+      if (!Array.isArray(item.claims)) item.claims = [];
+      if ((item.quantity || 1) > 1) {
+        const claimed = item.claims.reduce((s, c) => s + (c.units || 0), 0);
+        const remaining = item.quantity - claimed;
+        if (remaining <= 0) continue;
+        if (mode === 'me') {
+          const mine = item.claims.find(c => c.guestName === session.hostName);
+          if (mine) mine.units = (mine.units || 0) + remaining;
+          else item.claims.push({ guestName: session.hostName, units: remaining });
+        }
+        // 'split' for quantity items: leave as-is (unit assignment is ambiguous)
+      } else {
+        const splitCount = item.claims[0]?.splitCount || 1;
+        const fullyClaimed = item.claims.length >= splitCount && item.claims.length > 0;
+        if (fullyClaimed) continue;
+        if (mode === 'me') {
+          if (!item.claims.some(c => c.guestName === session.hostName)) {
+            // host absorbs: make host a claimer at the current split, filling the gap
+            item.claims.push({ guestName: session.hostName, splitCount: Math.max(splitCount, item.claims.length + 1) });
+          }
+        } else if (mode === 'split') {
+          item.claims = participants.map(name => ({ guestName: name, splitCount: participants.length }));
+        }
+      }
+      delete item.dispute;
+    }
+    store.saveSession(session);
+    io.to(sessionId).emit('item-claimed', { items: session.items });
+  });
+
+  // Host removes a guest (rando joined / mistake) and frees their claims.
+  socket.on('remove-guest', ({ sessionId, guestName }) => {
+    const session = getSession(sessionId);
+    if (!session) return;
+    const meta = socketMeta.get(socket.id);
+    if (!meta || !meta.isHost) return; // host-only
+    if (!guestName || guestName === session.hostName) return;
+    session.guests = (session.guests || []).filter(g => g.name !== guestName);
+    session.payments = (session.payments || []).filter(p => p.guestName !== guestName);
+    if (Array.isArray(session.doneClaiming)) session.doneClaiming = session.doneClaiming.filter(n => n !== guestName);
+    for (const item of session.items) {
+      if (Array.isArray(item.claims)) item.claims = item.claims.filter(c => c.guestName !== guestName);
+      if (item.dispute?.by === guestName) delete item.dispute;
+    }
+    store.saveSession(session);
+    io.to(sessionId).emit('session-updated', session);
+  });
+
   socket.on('disconnect', () => {
     socketMeta.delete(socket.id);
     console.log('Client disconnected:', socket.id);
@@ -640,17 +722,20 @@ io.on('connection', (socket) => {
 });
 
 // payment.status: 'unpaid' | 'paid' (guest asserts) | 'confirmed' (host verified)
+// We snapshot `paidTotal` = what the person owed at the moment they were marked
+// paid, so the dashboard can detect when later claim changes make that stale.
 function setPaymentStatus(session, guestName, status) {
   if (!Array.isArray(session.payments)) session.payments = [];
   const now = Date.now();
-  const existing = session.payments.find(p => p.guestName === guestName);
   const paid = status === 'paid' || status === 'confirmed';
+  const snapshot = paid ? (calculateAllPersonTotals(session)[guestName]?.total ?? 0) : null;
+  const existing = session.payments.find(p => p.guestName === guestName);
   if (existing) {
     existing.status = status;
     existing.paid = paid; // backward-compat boolean
-    if (status === 'paid') existing.paidAt = now;
-    if (status === 'confirmed') existing.confirmedAt = now;
-    if (status === 'unpaid') { delete existing.paidAt; delete existing.confirmedAt; }
+    if (status === 'paid') { existing.paidAt = now; existing.paidTotal = snapshot; }
+    if (status === 'confirmed') { existing.confirmedAt = now; if (existing.paidTotal == null) existing.paidTotal = snapshot; }
+    if (status === 'unpaid') { delete existing.paidAt; delete existing.confirmedAt; delete existing.paidTotal; }
   } else {
     session.payments.push({
       guestName,
@@ -659,6 +744,7 @@ function setPaymentStatus(session, guestName, status) {
       paid,
       paidAt: status === 'paid' ? now : undefined,
       confirmedAt: status === 'confirmed' ? now : undefined,
+      paidTotal: snapshot,
     });
   }
 }

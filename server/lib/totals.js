@@ -142,4 +142,20 @@ function calculateUnaccounted(session) {
   return { unclaimedItemValue, totalUnaccounted };
 }
 
-module.exports = { round2, distributeProportionally, getAllParticipants, calculateAllPersonTotals, calculateUnaccounted };
+// True if any non-host participant who claimed items still owes (not confirmed/paid).
+// Used so we NEVER prune a session that still has money outstanding.
+function hasOutstandingBalance(session) {
+  const totals = calculateAllPersonTotals(session);
+  const payments = session.payments || [];
+  for (const name of getAllParticipants(session)) {
+    if (name === session.hostName) continue;
+    const owed = totals[name]?.total || 0;
+    if (owed <= 0) continue;
+    const p = payments.find(x => x.guestName === name);
+    const status = p?.status || (p?.paid ? 'paid' : 'unpaid');
+    if (status !== 'paid' && status !== 'confirmed') return true;
+  }
+  return false;
+}
+
+module.exports = { round2, distributeProportionally, getAllParticipants, calculateAllPersonTotals, calculateUnaccounted, hasOutstandingBalance };

@@ -83,6 +83,7 @@ export default function Summary() {
     function onGuestJoined({ guests }) {
       dispatch({ type: 'SYNC_GUESTS', guests });
     }
+    function onSessionUpdated(session) { if (session) dispatch({ type: 'LOAD_SESSION', session }); }
     function onReconnect() {
       socket.emit('rejoin-room', { sessionId, guestName: state.currentUser?.name, isHost: state.currentUser?.isHost });
     }
@@ -92,6 +93,7 @@ export default function Summary() {
     socket.on('item-disputed',     onItemsSync);
     socket.on('dispute-cancelled', onItemsSync);
     socket.on('guest-joined',      onGuestJoined);
+    socket.on('session-updated',   onSessionUpdated);
     socket.on('connect',           onReconnect);
 
     return () => {
@@ -100,6 +102,7 @@ export default function Summary() {
       socket.off('item-disputed',     onItemsSync);
       socket.off('dispute-cancelled', onItemsSync);
       socket.off('guest-joined',      onGuestJoined);
+      socket.off('session-updated',   onSessionUpdated);
       socket.off('connect',           onReconnect);
     };
   }, [dispatch, sessionId, state, myName]);

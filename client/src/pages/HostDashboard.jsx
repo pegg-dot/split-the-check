@@ -42,6 +42,11 @@ export default function HostDashboard() {
     function onClaimingUpdate({ doneClaiming: done }) {
       setDoneClaiming(done);
     }
+    function onSessionUpdated(session) {
+      if (!session) return;
+      dispatch({ type: 'LOAD_SESSION', session });
+      if (session.doneClaiming) setDoneClaiming(session.doneClaiming);
+    }
 
     socket.on('item-claimed', onSyncItems);
     socket.on('item-unclaimed', onSyncItems);
@@ -50,6 +55,7 @@ export default function HostDashboard() {
     socket.on('guest-joined', onGuestJoined);
     socket.on('payment-updated', onPaymentUpdated);
     socket.on('claiming-update', onClaimingUpdate);
+    socket.on('session-updated', onSessionUpdated);
 
     return () => {
       socket.off('item-claimed', onSyncItems);
@@ -59,6 +65,7 @@ export default function HostDashboard() {
       socket.off('guest-joined', onGuestJoined);
       socket.off('payment-updated', onPaymentUpdated);
       socket.off('claiming-update', onClaimingUpdate);
+      socket.off('session-updated', onSessionUpdated);
     };
   }, [dispatch, sessionId]);
 
@@ -68,10 +75,18 @@ export default function HostDashboard() {
     return getAllParticipants(state).map(name => {
       const totals  = allTotals[name] || {};
       const payment = state.payments.find(p => p.guestName === name);
+      const total   = totals.total || 0;
+      const paidStatus = name === state.hostName ? 'host' : (payment?.status || (payment?.paid ? 'paid' : 'unpaid'));
+      // Stale: they were marked paid for one amount, but later claim changes moved their total.
+      const stale = (paidStatus === 'paid' || paidStatus === 'confirmed') && payment?.paidTotal != null
+        && Math.abs(total - payment.paidTotal) >= 0.01;
       return {
         name,
         isHost:       name === state.hostName,
-        total:        totals.total        || 0,
+        total,
+        paidTotal:    payment?.paidTotal ?? null,
+        stale,
+        staleDelta:   stale ? round2(total - payment.paidTotal) : 0,
         itemsTotal:   totals.itemsTotal   || 0,
         taxShare:     totals.taxShare     || 0,
         tipShare:     totals.tipShare     || 0,
@@ -132,6 +147,25 @@ export default function HostDashboard() {
     socket.emit('confirm-paid', { sessionId, guestName });
     dispatch({ type: 'MARK_PAID', guestName, status: 'confirmed' });
   }
+
+  // One-tap resolve the unclaimed remainder so nothing silently falls on the host.
+  function resolveLeftover(mode) {
+    socket.emit('resolve-leftover', { sessionId, mode });
+  }
+
+  // Host breaks a dispute deadlock by assigning the item to one party.
+  function resolveDispute(itemId, assignTo) {
+    socket.emit('resolve-dispute', { sessionId, itemId, assignTo });
+  }
+
+  // Remove a guest who joined by mistake / a rando from a shared QR.
+  function removeGuest(name) {
+    if (!window.confirm(`Remove ${name} from this split? Their claims will be released.`)) return;
+    socket.emit('remove-guest', { sessionId, guestName: name });
+  }
+
+  // Items currently under dispute (host can arbitrate).
+  const disputedItems = state.items.filter(i => i.dispute);
 
   // Nudge an unpaid guest with their amount + the join link (uses the phone's
   // native share sheet / SMS — no SMS provider needed).
@@ -208,10 +242,43 @@ export default function HostDashboard() {
             }).join(', ')}
           </p>
           {totalUnaccounted > 0 && (
-            <p style={{ fontSize: '0.813rem', fontWeight: 800, color: '#bf360c', marginTop: '8px' }}>
-              {formatPrice(totalUnaccounted)} of the bill is unclaimed — you'll cover this unless someone claims it.
-            </p>
+            <>
+              <p style={{ fontSize: '0.813rem', fontWeight: 800, color: '#bf360c', marginTop: '8px' }}>
+                {formatPrice(totalUnaccounted)} of the bill is unclaimed — you'll cover this unless someone claims it.
+              </p>
+              <div style={{ display: 'flex', gap: '8px', justifyContent: 'center', marginTop: '10px', flexWrap: 'wrap' }}>
+                <button className="btn btn-sm" style={{ background: '#fff', border: '1px solid #ffb74d', color: '#bf360c', fontWeight: 700 }}
+                  onClick={() => resolveLeftover('me')}>I'll cover the rest</button>
+                <button className="btn btn-sm" style={{ background: '#fff', border: '1px solid #ffb74d', color: '#bf360c', fontWeight: 700 }}
+                  onClick={() => resolveLeftover('split')}>Split evenly</button>
+              </div>
+            </>
           )}
+        </div>
+      )}
+
+      {/* Dispute arbitration — host breaks deadlocks */}
+      {disputedItems.length > 0 && (
+        <div style={{ padding: '12px 16px', borderRadius: '8px', background: '#fff3e0', border: '1px solid #ffb74d', marginBottom: '16px' }}>
+          <p style={{ fontSize: '0.813rem', fontWeight: 700, color: '#e65100', marginBottom: '8px' }}>
+            Disputes to resolve
+          </p>
+          {disputedItems.map(item => {
+            const claimer = item.claims[0]?.guestName;
+            const disputer = item.dispute?.by;
+            return (
+              <div key={item.id} style={{ marginBottom: '8px' }}>
+                <p className="text-sm" style={{ fontWeight: 600 }}>{item.name} — {formatPrice(item.price)}</p>
+                <p className="text-sm text-muted" style={{ marginBottom: '4px' }}>
+                  {disputer} says this is theirs{claimer ? `, currently ${claimer}'s` : ''}.
+                </p>
+                <div style={{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+                  {claimer && <button className="btn btn-sm btn-secondary" onClick={() => resolveDispute(item.id, claimer)}>Give to {claimer}</button>}
+                  {disputer && <button className="btn btn-sm btn-secondary" onClick={() => resolveDispute(item.id, disputer)}>Give to {disputer}</button>}
+                </div>
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -265,6 +332,15 @@ export default function HostDashboard() {
                 {formatPrice(person.total)}
               </span>
             </div>
+
+            {/* Stale-payment guard: total moved after they were marked paid */}
+            {person.stale && (
+              <div style={{ marginTop: '6px', padding: '6px 10px', borderRadius: '6px', background: '#fff3e0', border: '1px solid #ffb74d' }}>
+                <span style={{ fontSize: '0.75rem', fontWeight: 700, color: '#bf360c' }}>
+                  ⚠ Paid for {formatPrice(person.paidTotal)}, now {formatPrice(person.total)} — {person.staleDelta > 0 ? `owes ${formatPrice(person.staleDelta)} more` : `overpaid ${formatPrice(-person.staleDelta)}`}
+                </span>
+              </div>
+            )}
 
             {/* Claimed items as sub-lines */}
             {person.claimedItems.length > 0 ? (
@@ -329,6 +405,12 @@ export default function HostDashboard() {
                     Remind
                   </button>
                 )}
+                <button
+                  style={{ padding: '6px 10px', borderRadius: '8px', border: 'none', background: 'transparent', color: 'var(--color-text-muted)', fontSize: '0.75rem', cursor: 'pointer' }}
+                  onClick={() => removeGuest(person.name)}
+                >
+                  Remove
+                </button>
               </div>
             )}
           </div>
