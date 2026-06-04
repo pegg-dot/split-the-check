@@ -8,3 +8,6 @@ server/.env
 *.log
 .DS_Store
 Thumbs.db
+
+# persistent session store
+data/

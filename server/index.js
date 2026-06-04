@@ -6,6 +6,11 @@ const http = require('http');
 const { Server } = require('socket.io');
 const Anthropic = require('@anthropic-ai/sdk');
 
+const store = require('./store');
+const { createRateLimiter } = require('./lib/rate-limit');
+const { sanitizeScan } = require('./lib/sanitize');
+const { sendEmail, notifyEnabled } = require('./lib/notify');
+
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server, {
@@ -14,6 +19,9 @@ const io = new Server(server, {
 
 const PORT = process.env.PORT || 3001;
 
+// Behind Railway/other proxies so req.ip / x-forwarded-for resolve correctly
+// (the rate limiter keys on real client IP).
+app.set('trust proxy', 1);
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
@@ -21,13 +29,22 @@ const anthropic = new Anthropic.default({
   apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
-// ===== In-memory session store =====
-const sessions = new Map();
+// Load persisted sessions from disk on boot (survives restarts/crashes).
+store.load();
 
-function createSession(sessionId, hostName, venmoHandle) {
+// Periodic prune of expired sessions (TTL is refreshed on every activity).
+const prune = setInterval(() => {
+  const removed = store.pruneExpired();
+  if (removed > 0) console.log(`[store] pruned ${removed} expired session(s)`);
+}, 5 * 60 * 1000);
+if (prune.unref) prune.unref();
+
+// ===== Session helpers =====
+function createSession(sessionId, hostName, venmoHandle, hostDisplayName) {
   const session = {
     id: sessionId,
     hostName,
+    hostDisplayName: hostDisplayName || null, // verified Venmo display name
     venmoHandle,
     items: [],
     subtotal: 0,
@@ -36,26 +53,26 @@ function createSession(sessionId, hostName, venmoHandle) {
     guests: [],
     payments: [],
     createdAt: Date.now(),
+    updatedAt: Date.now(),
   };
-  sessions.set(sessionId, session);
+  store.saveSession(session);
   return session;
 }
 
 function getSession(sessionId) {
-  return sessions.get(sessionId) || null;
+  return store.getSession(sessionId);
 }
 
-// Clean up sessions older than 4 hours
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of sessions) {
-    if (now - session.createdAt > 4 * 60 * 60 * 1000) {
-      sessions.delete(id);
-    }
-  }
-}, 60 * 1000);
-
 // ===== REST endpoints =====
+
+// Rate limit the expensive, unauthenticated AI endpoint so a stranger who finds
+// the URL can't run up the Anthropic bill.
+const scanLimiter = createRateLimiter({
+  windowMs: 60 * 1000,
+  max: Number(process.env.SCAN_MAX_PER_MIN) || 6,       // per IP / minute
+  dailyMax: Number(process.env.SCAN_MAX_PER_DAY) || 500, // global / day
+  name: 'scan',
+});
 
 // Verify Venmo account exists
 app.post('/api/verify-venmo', async (req, res) => {
@@ -120,8 +137,12 @@ app.post('/api/verify-venmo', async (req, res) => {
   }
 });
 
-app.post('/api/scan-receipt', async (req, res) => {
+app.post('/api/scan-receipt', scanLimiter, async (req, res) => {
   try {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return res.status(503).json({ error: 'Receipt scanning is unavailable right now. You can enter items manually.' });
+    }
+
     const { image } = req.body;
 
     if (!image) {
@@ -210,10 +231,17 @@ FINAL CHECK: sum(items) + tax + adminFee + tipAmount must equal the receipt's pr
           jsonStr = codeBlockMatch[1].trim();
         }
 
-        const data = JSON.parse(jsonStr);
+        const parsed = JSON.parse(jsonStr);
+
+        // Coerce/validate all numbers server-side so the client never sees NaN.
+        const data = sanitizeScan(parsed);
+
+        if (!data.items.length) {
+          return res.status(422).json({ error: 'No items found on the receipt. Try a clearer photo.' });
+        }
 
         // If non-USD currency detected, fetch exchange rate to USD
-        const currency = (data.currency || 'USD').toUpperCase();
+        const currency = data.currency;
         let exchangeRate = 1;
         if (currency !== 'USD') {
           try {
@@ -229,7 +257,6 @@ FINAL CHECK: sum(items) + tax + adminFee + tipAmount must equal the receipt's pr
             exchangeRate = fallback[currency] || 1;
           }
         }
-        data.currency = currency;
         data.exchangeRate = exchangeRate;
         return res.json(data);
       } catch (err) {
@@ -271,20 +298,62 @@ app.get('/api/session/:sessionId', (req, res) => {
   if (!session) {
     return res.status(404).json({ error: 'Session not found' });
   }
+  store.touchSession(session.id); // viewing keeps it alive
   res.json(session);
 });
 
+// Optional: email a session summary (P3). Returns 202 (disabled) unless RESEND_API_KEY is set.
+app.post('/api/session/:sessionId/email-summary', async (req, res) => {
+  const session = getSession(req.params.sessionId);
+  if (!session) return res.status(404).json({ error: 'Session not found' });
+  const { to } = req.body || {};
+  if (!to || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to)) {
+    return res.status(400).json({ error: 'Valid recipient email required' });
+  }
+
+  const { buildSummaryEmail } = require('./lib/summary-email');
+  const { subject, html, text } = buildSummaryEmail(session);
+  const result = await sendEmail({ to, subject, html, text });
+  if (result.disabled) {
+    return res.status(202).json({ ok: false, disabled: true, message: 'Email is not configured on this server.' });
+  }
+  return res.status(result.ok ? 200 : 502).json(result);
+});
+
+app.get('/api/health', (req, res) => {
+  res.json({
+    ok: true,
+    sessions: store.allSessions().length,
+    aiEnabled: !!process.env.ANTHROPIC_API_KEY,
+    emailEnabled: notifyEnabled,
+  });
+});
+
 // ===== Socket.io real-time sync =====
+
+// Bind each socket to a single identity so guests can only act as themselves
+// (prevents spoofing other people's claims / payments via crafted payloads).
+/** @type {Map<string, { sessionId: string, name: string, isHost: boolean }>} */
+const socketMeta = new Map();
+
+function nameTaken(session, name) {
+  const lc = name.toLowerCase();
+  if ((session.hostName || '').toLowerCase() === lc) return true;
+  return session.guests.some(g => g.name.toLowerCase() === lc);
+}
 
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
   // Host creates a session
-  socket.on('create-session', ({ sessionId, hostName, venmoHandle, items, subtotal, tax, tipPercent, tipMode, tipDollar, tipIncluded, tipAmount, adminFee, currency, exchangeRate }) => {
+  socket.on('create-session', ({ sessionId, hostName, venmoHandle, hostDisplayName, items, subtotal, tax, tipPercent, tipMode, tipDollar, tipIncluded, tipAmount, adminFee, currency, exchangeRate }) => {
     let session = getSession(sessionId);
     if (!session) {
-      session = createSession(sessionId, hostName, venmoHandle);
+      session = createSession(sessionId, hostName, venmoHandle, hostDisplayName);
     }
+    session.hostName = hostName ?? session.hostName;
+    session.venmoHandle = venmoHandle ?? session.venmoHandle;
+    if (hostDisplayName) session.hostDisplayName = hostDisplayName;
     session.items = items;
     session.subtotal = subtotal;
     session.tax = tax;
@@ -296,15 +365,21 @@ io.on('connection', (socket) => {
     session.adminFee = adminFee || 0;
     session.currency = currency || 'USD';
     session.exchangeRate = exchangeRate || 1;
+    store.saveSession(session);
     socket.join(sessionId);
+    socketMeta.set(socket.id, { sessionId, name: hostName, isHost: true });
     console.log(`Session ${sessionId} created by ${hostName}`);
   });
 
   // Rejoin socket room (for reconnects / page navigations)
-  socket.on('rejoin-room', ({ sessionId }) => {
+  socket.on('rejoin-room', ({ sessionId, guestName, isHost }) => {
     const session = getSession(sessionId);
     if (session) {
       socket.join(sessionId);
+      // Re-establish identity after a navigation/reconnect.
+      if (guestName) {
+        socketMeta.set(socket.id, { sessionId, name: guestName, isHost: !!isHost });
+      }
     }
   });
 
@@ -316,86 +391,123 @@ io.on('connection', (socket) => {
       return;
     }
 
+    const name = (guestName || '').trim();
+    if (!name) {
+      socket.emit('error', { message: 'Please enter a name' });
+      return;
+    }
+
+    // Reject duplicate names so two people can't merge into one set of claims.
+    // (Allow the SAME socket to re-emit join with its own name — reconnect.)
+    const existing = socketMeta.get(socket.id);
+    const isReconnectingSameName = existing && existing.name.toLowerCase() === name.toLowerCase();
+    if (!isReconnectingSameName && nameTaken(session, name)) {
+      socket.emit('error', { message: `"${name}" is already taken at this table. Add a last initial (e.g. "${name} B.").` });
+      return;
+    }
+
     // Add guest if not already present
-    if (!session.guests.find(g => g.name === guestName)) {
-      session.guests.push({ name: guestName, joinedAt: Date.now() });
+    if (!session.guests.find(g => g.name === name)) {
+      session.guests.push({ name, joinedAt: Date.now() });
+      store.saveSession(session);
     }
 
     socket.join(sessionId);
+    socketMeta.set(socket.id, { sessionId, name, isHost: false });
     // Send current session state to the joining guest
     socket.emit('session-state', session);
     // Notify everyone that a new guest joined
-    io.to(sessionId).emit('guest-joined', { name: guestName, guests: session.guests });
-    console.log(`${guestName} joined session ${sessionId}`);
+    io.to(sessionId).emit('guest-joined', { name, guests: session.guests });
+    console.log(`${name} joined session ${sessionId}`);
   });
+
+  // Resolve the acting identity for a mutation. Falls back to the payload name
+  // for older clients, but a bound (guest) identity always wins.
+  function actorName(payloadName) {
+    const meta = socketMeta.get(socket.id);
+    if (meta && !meta.isHost) return meta.name; // guests locked to themselves
+    return payloadName; // host (or unbound legacy socket) may act broadly
+  }
 
   // Someone claims an item
   socket.on('claim-item', ({ sessionId, itemId, guestName, splitCount }) => {
     const session = getSession(sessionId);
     if (!session) return;
+    const actor = actorName(guestName);
+    if (!actor) return;
 
     const item = session.items.find(i => i.id === itemId);
     if (!item) return;
+    if (!Array.isArray(item.claims)) item.claims = [];
 
-    // Don't allow claiming if someone else already claimed it (unless it's a shared/split item)
-    const existingClaim = item.claims.find(c => c.guestName === guestName);
+    // Don't allow claiming if this person already claimed it
+    const existingClaim = item.claims.find(c => c.guestName === actor);
     if (existingClaim) return;
 
-    item.claims.push({ guestName, splitCount });
-    // Clear any dispute when item is claimed
+    item.claims.push({ guestName: actor, splitCount });
     delete item.dispute;
-    io.to(sessionId).emit('item-claimed', { itemId, guestName, splitCount, items: session.items });
+    store.saveSession(session);
+    io.to(sessionId).emit('item-claimed', { itemId, guestName: actor, splitCount, items: session.items });
   });
 
   // Someone unclaims an item
   socket.on('unclaim-item', ({ sessionId, itemId, guestName }) => {
     const session = getSession(sessionId);
     if (!session) return;
+    const actor = actorName(guestName);
+    if (!actor) return;
 
     const item = session.items.find(i => i.id === itemId);
     if (!item) return;
+    if (!Array.isArray(item.claims)) item.claims = [];
 
     // If there's an active dispute, auto-assign to the disputer
     const dispute = item.dispute;
-    item.claims = item.claims.filter(c => c.guestName !== guestName);
+    item.claims = item.claims.filter(c => c.guestName !== actor);
 
-    if (dispute && dispute.by !== guestName) {
+    if (dispute && dispute.by !== actor) {
       // Auto-claim for the disputer
       item.claims.push({ guestName: dispute.by, splitCount: 1 });
       delete item.dispute;
-      console.log(`Auto-assigned "${item.name}" to ${dispute.by} after ${guestName} released`);
+      console.log(`Auto-assigned "${item.name}" to ${dispute.by} after ${actor} released`);
     } else {
       delete item.dispute;
     }
 
-    io.to(sessionId).emit('item-unclaimed', { itemId, guestName, items: session.items });
+    store.saveSession(session);
+    io.to(sessionId).emit('item-unclaimed', { itemId, guestName: actor, items: session.items });
   });
 
   // Someone disputes another person's claim
   socket.on('dispute-item', ({ sessionId, itemId, disputerName }) => {
     const session = getSession(sessionId);
     if (!session) return;
+    const actor = actorName(disputerName);
+    if (!actor) return;
 
     const item = session.items.find(i => i.id === itemId);
     if (!item) return;
 
-    item.dispute = { by: disputerName };
-    console.log(`Dispute: ${disputerName} disputes item "${item.name}" in session ${sessionId}`);
-    io.to(sessionId).emit('item-disputed', { itemId, disputerName, items: session.items });
+    item.dispute = { by: actor };
+    store.saveSession(session);
+    console.log(`Dispute: ${actor} disputes item "${item.name}" in session ${sessionId}`);
+    io.to(sessionId).emit('item-disputed', { itemId, disputerName: actor, items: session.items });
   });
 
   // Someone cancels their dispute
   socket.on('cancel-dispute', ({ sessionId, itemId, disputerName }) => {
     const session = getSession(sessionId);
     if (!session) return;
+    const actor = actorName(disputerName);
 
     const item = session.items.find(i => i.id === itemId);
     if (!item) return;
 
     // Only the person who filed the dispute can cancel it
-    if (item.dispute && item.dispute.by === disputerName) {
+    if (item.dispute && item.dispute.by === actor) {
       delete item.dispute;
-      console.log(`Dispute cancelled: ${disputerName} withdrew dispute on "${item.name}" in session ${sessionId}`);
+      store.saveSession(session);
+      console.log(`Dispute cancelled: ${actor} withdrew dispute on "${item.name}" in session ${sessionId}`);
       io.to(sessionId).emit('dispute-cancelled', { itemId, items: session.items });
     }
   });
@@ -404,12 +516,15 @@ io.on('connection', (socket) => {
   socket.on('share-item', ({ sessionId, itemId, guestName, splitCount }) => {
     const session = getSession(sessionId);
     if (!session) return;
+    const actor = actorName(guestName);
+    if (!actor) return;
 
     const item = session.items.find(i => i.id === itemId);
     if (!item) return;
+    if (!Array.isArray(item.claims)) item.claims = [];
 
     // Guard: person already claimed this item
-    if (item.claims.some(c => c.guestName === guestName)) return;
+    if (item.claims.some(c => c.guestName === actor)) return;
 
     // Minimum splitCount = existing claimers + 1
     const minCount = item.claims.length + 1;
@@ -418,11 +533,11 @@ io.on('connection', (socket) => {
     // Update every existing claim to the new splitCount
     item.claims = item.claims.map(c => ({ ...c, splitCount: finalCount }));
     // Add this person's claim
-    item.claims.push({ guestName, splitCount: finalCount });
-    // Clear any pending dispute
+    item.claims.push({ guestName: actor, splitCount: finalCount });
     delete item.dispute;
 
-    console.log(`${guestName} shared "${item.name}" (${finalCount} ways) in session ${sessionId}`);
+    store.saveSession(session);
+    console.log(`${actor} shared "${item.name}" (${finalCount} ways) in session ${sessionId}`);
     io.to(sessionId).emit('item-claimed', { items: session.items });
   });
 
@@ -430,22 +545,26 @@ io.on('connection', (socket) => {
   socket.on('claim-units', ({ sessionId, itemId, guestName, units }) => {
     const session = getSession(sessionId);
     if (!session) return;
+    const actor = actorName(guestName);
+    if (!actor) return;
     const item = session.items.find(i => i.id === itemId);
     if (!item || (item.quantity || 1) <= 1) return;
+    if (!Array.isArray(item.claims)) item.claims = [];
 
     const totalClaimed = item.claims.reduce((sum, c) => sum + (c.units || 0), 0);
     const available    = item.quantity - totalClaimed;
     const actualUnits  = Math.min(Math.max(1, units), available);
     if (actualUnits <= 0) return;
 
-    const existing = item.claims.find(c => c.guestName === guestName);
+    const existing = item.claims.find(c => c.guestName === actor);
     if (existing) {
       existing.units = (existing.units || 0) + actualUnits;
     } else {
-      item.claims.push({ guestName, units: actualUnits });
+      item.claims.push({ guestName: actor, units: actualUnits });
     }
     delete item.dispute;
-    console.log(`${guestName} claimed ${actualUnits} units of "${item.name}" in session ${sessionId}`);
+    store.saveSession(session);
+    console.log(`${actor} claimed ${actualUnits} units of "${item.name}" in session ${sessionId}`);
     io.to(sessionId).emit('item-claimed', { items: session.items });
   });
 
@@ -453,9 +572,13 @@ io.on('connection', (socket) => {
   socket.on('unclaim-units', ({ sessionId, itemId, guestName }) => {
     const session = getSession(sessionId);
     if (!session) return;
+    const actor = actorName(guestName);
+    if (!actor) return;
     const item = session.items.find(i => i.id === itemId);
     if (!item) return;
-    item.claims = item.claims.filter(c => c.guestName !== guestName);
+    if (!Array.isArray(item.claims)) item.claims = [];
+    item.claims = item.claims.filter(c => c.guestName !== actor);
+    store.saveSession(session);
     io.to(sessionId).emit('item-unclaimed', { items: session.items });
   });
 
@@ -463,32 +586,82 @@ io.on('connection', (socket) => {
   socket.on('done-claiming', ({ sessionId, guestName }) => {
     const session = getSession(sessionId);
     if (!session) return;
+    const actor = actorName(guestName);
+    if (!actor) return;
 
     if (!session.doneClaiming) session.doneClaiming = [];
-    if (!session.doneClaiming.includes(guestName)) {
-      session.doneClaiming.push(guestName);
+    if (!session.doneClaiming.includes(actor)) {
+      session.doneClaiming.push(actor);
     }
+    store.saveSession(session);
     io.to(sessionId).emit('claiming-update', { doneClaiming: session.doneClaiming });
   });
 
-  // Host marks someone as paid
+  // Guest asserts they paid (status: 'paid'). Host may also set this for someone.
   socket.on('mark-paid', ({ sessionId, guestName }) => {
     const session = getSession(sessionId);
     if (!session) return;
+    const meta = socketMeta.get(socket.id);
+    // A guest can only mark THEMSELVES; a host can mark anyone.
+    const target = (meta && !meta.isHost) ? meta.name : guestName;
+    if (!target) return;
+    setPaymentStatus(session, target, 'paid');
+    store.saveSession(session);
+    io.to(sessionId).emit('payment-updated', { guestName: target, payments: session.payments });
+  });
 
-    const existing = session.payments.find(p => p.guestName === guestName);
-    if (existing) {
-      existing.paid = true;
-    } else {
-      session.payments.push({ guestName, amount: 0, paid: true });
-    }
+  // Host confirms a payment actually arrived (status: 'confirmed').
+  socket.on('confirm-paid', ({ sessionId, guestName }) => {
+    const session = getSession(sessionId);
+    if (!session) return;
+    const meta = socketMeta.get(socket.id);
+    if (!meta || !meta.isHost) return; // host-only
+    setPaymentStatus(session, guestName, 'confirmed');
+    store.saveSession(session);
     io.to(sessionId).emit('payment-updated', { guestName, payments: session.payments });
   });
 
+  // Reset a payment back to unpaid (mistake fix). Guest can reset self; host anyone.
+  socket.on('reset-paid', ({ sessionId, guestName }) => {
+    const session = getSession(sessionId);
+    if (!session) return;
+    const meta = socketMeta.get(socket.id);
+    const target = (meta && !meta.isHost) ? meta.name : guestName;
+    if (!target) return;
+    setPaymentStatus(session, target, 'unpaid');
+    store.saveSession(session);
+    io.to(sessionId).emit('payment-updated', { guestName: target, payments: session.payments });
+  });
+
   socket.on('disconnect', () => {
+    socketMeta.delete(socket.id);
     console.log('Client disconnected:', socket.id);
   });
 });
+
+// payment.status: 'unpaid' | 'paid' (guest asserts) | 'confirmed' (host verified)
+function setPaymentStatus(session, guestName, status) {
+  if (!Array.isArray(session.payments)) session.payments = [];
+  const now = Date.now();
+  const existing = session.payments.find(p => p.guestName === guestName);
+  const paid = status === 'paid' || status === 'confirmed';
+  if (existing) {
+    existing.status = status;
+    existing.paid = paid; // backward-compat boolean
+    if (status === 'paid') existing.paidAt = now;
+    if (status === 'confirmed') existing.confirmedAt = now;
+    if (status === 'unpaid') { delete existing.paidAt; delete existing.confirmedAt; }
+  } else {
+    session.payments.push({
+      guestName,
+      amount: 0,
+      status,
+      paid,
+      paidAt: status === 'paid' ? now : undefined,
+      confirmedAt: status === 'confirmed' ? now : undefined,
+    });
+  }
+}
 
 // In production, serve the built React app from Express so everything
 // runs on a single URL (no CORS, no proxy, socket.io just works).
@@ -503,4 +676,7 @@ if (process.env.NODE_ENV === 'production') {
 
 server.listen(PORT, () => {
   console.log(`Server running on port ${PORT} [${process.env.NODE_ENV || 'development'}]`);
+  console.log(`AI scan: ${process.env.ANTHROPIC_API_KEY ? 'enabled' : 'DISABLED (set ANTHROPIC_API_KEY)'} · Email: ${notifyEnabled ? 'enabled' : 'disabled'}`);
 });
+
+module.exports = { app, server };
