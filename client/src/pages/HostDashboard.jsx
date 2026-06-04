@@ -1,7 +1,8 @@
 import { useState, useMemo, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useSession, calculateAllPersonTotals, getAllParticipants, formatPrice as fmtPrice, round2 } from '../context/SessionContext';
+import { useSession, calculateAllPersonTotals, calculateUnaccounted, getAllParticipants, formatPrice as fmtPrice, round2 } from '../context/SessionContext';
 import { socket, BACKEND_URL } from '../context/socket';
+import { recordSplit } from '../lib/history';
 
 export default function HostDashboard() {
   const { sessionId } = useParams();
@@ -76,6 +77,7 @@ export default function HostDashboard() {
         tipShare:     totals.tipShare     || 0,
         adminFeeShare: totals.adminFeeShare || 0,
         paid:         name === state.hostName ? true : (payment?.paid || false),
+        status:       name === state.hostName ? 'host' : (payment?.status || (payment?.paid ? 'paid' : 'unpaid')),
         claimedItems: (totals.claimedItems || []).map(item => ({
           name:       item.name,
           price:      item.price,
@@ -104,15 +106,48 @@ export default function HostDashboard() {
     .map(g => g.name)
     .filter(name => name !== state.hostName && !doneClaiming.includes(name));
 
-  function togglePaid(guestName) {
-    const payment = state.payments.find(p => p.guestName === guestName);
-    if (payment?.paid) return;
+  // Dollar amount nobody has claimed — surfaced so the host never silently eats it.
+  const { totalUnaccounted } = calculateUnaccounted(state);
 
+  // Keep the on-device history entry fresh (total/guests/settled) for Home.
+  useEffect(() => {
+    if (!sessionId || getAllParticipants(state).length === 0) return;
+    recordSplit({
+      sessionId,
+      hostName: state.hostName,
+      currency: state.currency,
+      total: round2(everyone.reduce((s, p) => round2(s + p.total), 0)),
+      guests: state.guests.length,
+    });
+  }, [sessionId, state.hostName, state.currency, state.guests.length, everyone]);
+
+  // Host marks a guest as paid (e.g. they handed cash). status: 'paid'.
+  function hostMarkPaid(guestName) {
     socket.emit('mark-paid', { sessionId, guestName });
-    if (!payment) {
-      dispatch({ type: 'SET_PAYMENTS', payments: [...state.payments, { guestName, amount: 0, paid: true }] });
-    } else {
-      dispatch({ type: 'MARK_PAID', guestName });
+    dispatch({ type: 'MARK_PAID', guestName, status: 'paid' });
+  }
+
+  // Host confirms a guest-asserted payment actually arrived. status: 'confirmed'.
+  function hostConfirm(guestName) {
+    socket.emit('confirm-paid', { sessionId, guestName });
+    dispatch({ type: 'MARK_PAID', guestName, status: 'confirmed' });
+  }
+
+  // Nudge an unpaid guest with their amount + the join link (uses the phone's
+  // native share sheet / SMS — no SMS provider needed).
+  async function remind(person) {
+    const link = `${window.location.origin}/session/${sessionId}`;
+    const amount = formatPrice(person.total);
+    const msg = `Hey ${person.name}! You owe ${amount} for the bill. Pay ${state.hostDisplayName || state.hostName} here: ${link}`;
+    if (navigator.share) {
+      try { await navigator.share({ title: 'Split the Check', text: msg }); return; } catch { /* cancelled */ }
+    }
+    // Fallback: open SMS composer prefilled, or copy to clipboard.
+    const sms = `sms:?&body=${encodeURIComponent(msg)}`;
+    try {
+      window.location.href = sms;
+    } catch {
+      try { await navigator.clipboard.writeText(msg); alert('Reminder copied to clipboard'); } catch {}
     }
   }
 
@@ -172,6 +207,11 @@ export default function HostDashboard() {
               return isPartial ? `${i.name} (${i.claims.length}/${i.claims[0].splitCount} claimed)` : i.name;
             }).join(', ')}
           </p>
+          {totalUnaccounted > 0 && (
+            <p style={{ fontSize: '0.813rem', fontWeight: 800, color: '#bf360c', marginTop: '8px' }}>
+              {formatPrice(totalUnaccounted)} of the bill is unclaimed — you'll cover this unless someone claims it.
+            </p>
+          )}
         </div>
       )}
 
@@ -205,20 +245,21 @@ export default function HostDashboard() {
                   {person.name}
                   {person.isHost && <span className="text-muted" style={{ fontWeight: 400, fontSize: '0.75rem', marginLeft: '6px' }}>(you)</span>}
                 </span>
-                {!person.isHost && (
-                  <span style={{
-                    fontSize: '0.688rem',
-                    fontWeight: 700,
-                    padding: '2px 8px',
-                    borderRadius: '10px',
-                    background: person.paid ? 'var(--color-success-light, #e8f5e9)' : '#fff3e0',
-                    color: person.paid ? 'var(--color-success, #2e7d32)' : '#e65100',
-                    textTransform: 'uppercase',
-                    letterSpacing: '0.03em',
-                  }}>
-                    {person.paid ? 'Paid' : 'Pending'}
-                  </span>
-                )}
+                {!person.isHost && (() => {
+                  const styles = {
+                    confirmed: { bg: 'var(--color-success-light, #e8f5e9)', fg: 'var(--color-success, #2e7d32)', label: 'Confirmed' },
+                    paid:      { bg: '#e3f2fd', fg: '#1565c0', label: 'Says paid' },
+                    unpaid:    { bg: '#fff3e0', fg: '#e65100', label: 'Pending' },
+                  }[person.status] || { bg: '#fff3e0', fg: '#e65100', label: 'Pending' };
+                  return (
+                    <span style={{
+                      fontSize: '0.688rem', fontWeight: 700, padding: '2px 8px', borderRadius: '10px',
+                      background: styles.bg, color: styles.fg, textTransform: 'uppercase', letterSpacing: '0.03em',
+                    }}>
+                      {styles.label}
+                    </span>
+                  );
+                })()}
               </div>
               <span style={{ fontWeight: 800, fontSize: '1.05rem', fontFamily: 'monospace' }}>
                 {formatPrice(person.total)}
@@ -261,24 +302,34 @@ export default function HostDashboard() {
               </p>
             )}
 
-            {/* Mark as Paid button for guests */}
-            {!person.isHost && !person.paid && person.claimedItems.length > 0 && (
-              <button
-                style={{
-                  marginTop: '8px',
-                  padding: '6px 14px',
-                  borderRadius: '8px',
-                  border: 'none',
-                  background: 'var(--color-success-light, #e8f5e9)',
-                  color: 'var(--color-success, #2e7d32)',
-                  fontSize: '0.813rem',
-                  fontWeight: 700,
-                  cursor: 'pointer',
-                }}
-                onClick={() => togglePaid(person.name)}
-              >
-                Mark as Paid
-              </button>
+            {/* Host actions per guest: confirm a claimed payment, mark cash-paid, or remind */}
+            {!person.isHost && person.status !== 'confirmed' && (
+              <div style={{ display: 'flex', gap: '8px', flexWrap: 'wrap', marginTop: '8px' }}>
+                {person.status === 'paid' && (
+                  <button
+                    style={{ padding: '6px 14px', borderRadius: '8px', border: 'none', background: 'var(--color-success-light, #e8f5e9)', color: 'var(--color-success, #2e7d32)', fontSize: '0.813rem', fontWeight: 700, cursor: 'pointer' }}
+                    onClick={() => hostConfirm(person.name)}
+                  >
+                    Confirm received
+                  </button>
+                )}
+                {person.status === 'unpaid' && person.claimedItems.length > 0 && (
+                  <button
+                    style={{ padding: '6px 14px', borderRadius: '8px', border: '1px solid var(--color-border)', background: 'transparent', color: 'var(--color-text)', fontSize: '0.813rem', fontWeight: 700, cursor: 'pointer' }}
+                    onClick={() => hostMarkPaid(person.name)}
+                  >
+                    Mark paid (cash)
+                  </button>
+                )}
+                {person.total > 0 && (
+                  <button
+                    style={{ padding: '6px 14px', borderRadius: '8px', border: '1px dashed var(--color-accent)', background: 'transparent', color: 'var(--color-accent)', fontSize: '0.813rem', fontWeight: 700, cursor: 'pointer' }}
+                    onClick={() => remind(person)}
+                  >
+                    Remind
+                  </button>
+                )}
+              </div>
             )}
           </div>
         ))}

@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useSession, formatPrice as fmtPrice, currencySymbol, round2 } from '../context/SessionContext';
 import { socket } from '../context/socket';
+import { recordSplit } from '../lib/history';
 
 const TIP_PRESETS = [15, 18, 20];
 
@@ -53,11 +54,14 @@ export default function TipAndShare() {
     if (!socket.connected) {
       socket.connect();
     }
+    // Record to on-device history so the host can find it later from Home.
+    recordSplit({ sessionId, hostName: state.hostName, currency: state.currency, total: grandTotal, guests: state.guests.length });
     // Create/update session on server whenever tip settings change
     socket.emit('create-session', {
       sessionId,
       hostName: state.hostName,
       venmoHandle: state.venmoHandle,
+      hostDisplayName: state.hostDisplayName,
       items: state.items,
       subtotal: state.subtotal,
       tax: state.tax,

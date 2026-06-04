@@ -76,11 +76,11 @@ export default function ScanReceipt() {
         body: JSON.stringify({ image: preview }),
       });
 
+      // Surface the server's real message (AI disabled 503, rate-limit 429, etc.)
+      const data = await response.json().catch(() => ({}));
       if (!response.ok) {
-        throw new Error('Failed to scan receipt. Please try again.');
+        throw new Error(data.error || 'Failed to scan receipt. Please try again.');
       }
-
-      const data = await response.json();
 
       if (!data.items || data.items.length === 0) {
         throw new Error('No items found on the receipt. Try a clearer photo.');
@@ -188,6 +188,9 @@ export default function ScanReceipt() {
       {error && (
         <div className="card mt-16" style={{ borderColor: 'var(--color-accent)', background: 'var(--color-accent-light)' }}>
           <p style={{ color: 'var(--color-accent)', fontSize: '0.875rem', fontWeight: 500 }}>{error}</p>
+          <button className="btn btn-secondary btn-sm mt-12" onClick={() => navigate('/review')}>
+            Enter items manually instead
+          </button>
         </div>
       )}
 

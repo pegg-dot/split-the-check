@@ -1,11 +1,18 @@
-import { createContext, useContext, useReducer } from 'react';
+import { createContext, useContext, useReducer, useEffect } from 'react';
 
 const SessionContext = createContext(null);
+
+// Persist the in-progress split so a host doesn't lose everything on refresh
+// (the receipt lives only in React memory otherwise). Guest pages re-fetch
+// authoritative state from the server on mount, so this is mainly a host safety net.
+const PERSIST_KEY = 'stc_state_v1';
+const PERSIST_TTL_MS = 12 * 60 * 60 * 1000; // ignore anything older than 12h
 
 const initialState = {
   // Host info
   hostName: '',
   venmoHandle: '',
+  hostDisplayName: null, // verified Venmo display name
 
   // Receipt items from AI
   items: [], // { id, name, price, claims: [{ guestName, splitCount }] }
@@ -39,7 +46,11 @@ const initialState = {
 function sessionReducer(state, action) {
   switch (action.type) {
     case 'SET_HOST': {
-      return { ...state, hostName: action.name, venmoHandle: action.venmoHandle, currentUser: { name: action.name, isHost: true } };
+      return { ...state, hostName: action.name, venmoHandle: action.venmoHandle, hostDisplayName: action.hostDisplayName ?? state.hostDisplayName, currentUser: { name: action.name, isHost: true } };
+    }
+    case 'RESET': {
+      // Start a brand-new split (clears the persisted in-progress one).
+      return { ...initialState };
     }
     case 'SET_ITEMS': {
       const subtotal = action.items.reduce((sum, item) => sum + item.price, 0);
@@ -182,9 +193,12 @@ function sessionReducer(state, action) {
       return { ...state, items };
     }
     case 'MARK_PAID': {
-      const payments = state.payments.map(p =>
-        p.guestName === action.guestName ? { ...p, paid: true } : p
-      );
+      // Optimistic guest-asserted payment (server is authoritative via SYNC_PAYMENTS).
+      const status = action.status || 'paid';
+      const exists = state.payments.some(p => p.guestName === action.guestName);
+      const payments = exists
+        ? state.payments.map(p => p.guestName === action.guestName ? { ...p, paid: status !== 'unpaid', status } : p)
+        : [...state.payments, { guestName: action.guestName, amount: 0, paid: status !== 'unpaid', status }];
       return { ...state, payments };
     }
     case 'SET_PAYMENTS': {
@@ -196,6 +210,7 @@ function sessionReducer(state, action) {
         ...state,
         hostName: s.hostName,
         venmoHandle: s.venmoHandle,
+        hostDisplayName: s.hostDisplayName || null,
         items: s.items,
         subtotal: s.subtotal,
         tax: s.tax,
@@ -406,8 +421,70 @@ export function getAllParticipants(state) {
   return Array.from(names);
 }
 
+// The dollar value of the bill that NOBODY has claimed (fully or partially).
+// This is the amount the host silently eats unless it's surfaced — the
+// "money truth" number. We WARN with this; we do not change how splits divide.
+export function calculateUnaccounted(state) {
+  const { items, subtotal, tax = 0, adminFee = 0, tipIncluded, tipAmount = 0 } = state;
+  if (!subtotal || subtotal === 0) return { unclaimedItemValue: 0, totalUnaccounted: 0 };
+  const tipMode = state.tipMode || 'percent';
+  const tipDollar = Math.max(0, state.tipDollar || 0);
+  const tipPercent = Math.max(0, state.tipPercent || 0);
+
+  let claimedItemValue = 0;
+  for (const item of items) {
+    const claims = item.claims || [];
+    if (claims.length === 0) continue;
+    if ((item.quantity || 1) > 1) {
+      const unitsClaimed = claims.reduce((s, c) => s + (c.units || 0), 0);
+      claimedItemValue = round2(claimedItemValue + item.price * (unitsClaimed / item.quantity));
+    } else {
+      const splitCount = claims[0]?.splitCount || 1;
+      const perShare = item.price / splitCount;
+      claimedItemValue = round2(claimedItemValue + perShare * Math.min(claims.length, splitCount));
+    }
+  }
+
+  const unclaimedItemValue = round2(Math.max(0, subtotal - claimedItemValue));
+  const proportion = subtotal > 0 ? unclaimedItemValue / subtotal : 0;
+  const unTax = round2(tax * proportion);
+  const unAdmin = round2(adminFee * proportion);
+  let unTip = tipIncluded ? round2(tipAmount * proportion) : 0;
+  if (tipMode === 'dollar') unTip = round2(unTip + tipDollar * proportion);
+  else if (tipPercent > 0) unTip = round2(unTip + unclaimedItemValue * (tipPercent / 100));
+
+  const totalUnaccounted = round2(unclaimedItemValue + unTax + unAdmin + unTip);
+  return { unclaimedItemValue, totalUnaccounted };
+}
+
+// ── localStorage persistence (host refresh safety net) ──────────────────────
+function loadPersisted() {
+  try {
+    const raw = localStorage.getItem(PERSIST_KEY);
+    if (!raw) return null;
+    const { savedAt, state } = JSON.parse(raw);
+    if (!savedAt || Date.now() - savedAt > PERSIST_TTL_MS) return null;
+    return state;
+  } catch { return null; }
+}
+
+function persist(state) {
+  try {
+    // Don't bother persisting an empty/fresh state.
+    if (!state.hostName && !state.sessionId && (!state.items || state.items.length === 0)) {
+      localStorage.removeItem(PERSIST_KEY);
+      return;
+    }
+    localStorage.setItem(PERSIST_KEY, JSON.stringify({ savedAt: Date.now(), state }));
+  } catch { /* quota / private mode — ignore */ }
+}
+
 export function SessionProvider({ children }) {
-  const [state, dispatch] = useReducer(sessionReducer, initialState);
+  const [state, dispatch] = useReducer(sessionReducer, initialState, (init) => {
+    return { ...init, ...(loadPersisted() || {}) };
+  });
+
+  useEffect(() => { persist(state); }, [state]);
 
   return (
     <SessionContext.Provider value={{ state, dispatch }}>

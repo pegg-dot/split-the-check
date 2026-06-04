@@ -24,7 +24,8 @@ export default function ClaimItems() {
   // ── Socket setup ──────────────────────────────────────────────────
   useEffect(() => {
     if (!socket.connected) socket.connect();
-    socket.emit('rejoin-room', { sessionId });
+    const identity = { sessionId, guestName: state.currentUser?.name, isHost: state.currentUser?.isHost };
+    socket.emit('rejoin-room', identity);
 
     fetch(`${BACKEND_URL}/api/session/${sessionId}`)
       .then(r => r.ok ? r.json() : null)
@@ -33,7 +34,7 @@ export default function ClaimItems() {
 
     function onSyncItems({ items }) { dispatch({ type: 'SYNC_ITEMS', items }); }
     function onGuestJoined({ guests }) { dispatch({ type: 'SYNC_GUESTS', guests }); }
-    function onReconnect() { socket.emit('rejoin-room', { sessionId }); }
+    function onReconnect() { socket.emit('rejoin-room', identity); }
 
     socket.on('item-claimed',      onSyncItems);
     socket.on('item-unclaimed',    onSyncItems);

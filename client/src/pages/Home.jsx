@@ -1,16 +1,28 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useSession } from '../context/SessionContext';
+import { useSession, currencySymbol } from '../context/SessionContext';
 import { BACKEND_URL } from '../context/socket';
+import { getHistory } from '../lib/history';
 
 export default function Home() {
   const navigate = useNavigate();
-  const { dispatch } = useSession();
+  const { state, dispatch } = useSession();
   const [name, setName] = useState('');
   const [venmo, setVenmo] = useState('');
   const [currency, setCurrency] = useState('USD');
   const [verifying, setVerifying] = useState(false);
   const [venmoStatus, setVenmoStatus] = useState(null); // { valid, displayName, note, error }
+  const [history] = useState(() => getHistory());
+
+  // A split restored from localStorage (refresh safety net) → offer to resume.
+  const hasInProgress = (state.items && state.items.length > 0) || !!state.sessionId;
+  function resumeInProgress() {
+    if (state.sessionId) navigate(`/host/${state.sessionId}`);
+    else navigate('/review');
+  }
+  function startNew() {
+    dispatch({ type: 'RESET' });
+  }
 
   const CURRENCIES = [
     { code: 'USD', label: 'USD — US Dollar ($)' },
@@ -62,7 +74,8 @@ export default function Home() {
   function handleStart(e) {
     e.preventDefault();
     if (!canStart) return;
-    dispatch({ type: 'SET_HOST', name: name.trim(), venmoHandle: venmo.trim() });
+    dispatch({ type: 'RESET' }); // clear any stale in-progress split before starting fresh
+    dispatch({ type: 'SET_HOST', name: name.trim(), venmoHandle: venmo.trim(), hostDisplayName: venmoStatus?.displayName || null });
     dispatch({ type: 'SET_CURRENCY', currency, exchangeRate: 1 }); // rate fetched after scan
     navigate('/scan');
   }
@@ -74,6 +87,19 @@ export default function Home() {
         <h1>Split the Check</h1>
         <p className="mt-8">Scan. Claim. Pay. Done.</p>
       </div>
+
+      {/* Resume an in-progress split restored after a refresh */}
+      {hasInProgress && (
+        <div className="card mb-16" style={{ borderColor: 'var(--color-accent)', background: 'var(--color-accent-light)' }}>
+          <p className="text-sm" style={{ fontWeight: 700, marginBottom: '8px' }}>
+            You have a split in progress{state.items?.length ? ` (${state.items.length} items)` : ''}
+          </p>
+          <div style={{ display: 'flex', gap: '8px' }}>
+            <button type="button" className="btn btn-primary btn-sm" style={{ flex: 1 }} onClick={resumeInProgress}>Resume</button>
+            <button type="button" className="btn btn-ghost btn-sm" onClick={startNew}>Start new</button>
+          </div>
+        </div>
+      )}
 
       <form onSubmit={handleStart} className="flex-col gap-12">
         <div className="input-group">
@@ -174,6 +200,33 @@ export default function Home() {
           {verifying ? 'Verifying...' : 'Start Splitting'}
         </button>
       </form>
+
+      {/* Recent splits hosted on this device */}
+      {history.length > 0 && (
+        <div className="mt-24">
+          <h3 style={{ fontSize: '0.75rem', fontWeight: 700, textTransform: 'uppercase', letterSpacing: '0.04em', color: 'var(--color-text-muted)', marginBottom: '8px' }}>
+            Recent splits
+          </h3>
+          <div className="card" style={{ padding: '4px 0' }}>
+            {history.map((h) => (
+              <div
+                key={h.id}
+                className="item-row"
+                style={{ cursor: 'pointer' }}
+                onClick={() => navigate(`/host/${h.id}`)}
+              >
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <span className="item-name">{h.hostName || 'Split'}</span>
+                  <span className="text-sm text-muted" style={{ display: 'block' }}>
+                    {h.guests} {h.guests === 1 ? 'guest' : 'guests'}
+                  </span>
+                </div>
+                <span className="item-price">{currencySymbol(h.currency)}{(Number(h.total) || 0).toFixed(2)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { useSession, calculateAllPersonTotals, formatPrice as fmtPrice, toUSD } from '../context/SessionContext';
 import { socket, BACKEND_URL } from '../context/socket';
+import { openVenmo } from '../lib/venmo';
 
 export default function Summary() {
   const { sessionId } = useParams();
@@ -25,10 +26,17 @@ export default function Summary() {
   // { prevTotal, newTotal, changedBy, itemName }
   const prevTotalRef = useRef(myTotal.total);
 
+  // Payment state (two-step: pay → confirm). Server is authoritative.
+  const myPayment = state.payments.find(p => p.guestName === myName);
+  const myStatus  = myPayment?.status || (myPayment?.paid ? 'paid' : 'unpaid');
+  const isPaid    = myStatus === 'paid' || myStatus === 'confirmed';
+  const [awaitingConfirm, setAwaitingConfirm] = useState(false);
+  const hostLabel = state.hostDisplayName || state.hostName;
+
   // ── Socket: listen for real-time item changes ──────────────────────
   useEffect(() => {
     if (!socket.connected) socket.connect();
-    socket.emit('rejoin-room', { sessionId });
+    socket.emit('rejoin-room', { sessionId, guestName: state.currentUser?.name, isHost: state.currentUser?.isHost });
 
     function onItemsSync({ items }) {
       // Capture who/what changed before dispatching
@@ -76,7 +84,7 @@ export default function Summary() {
       dispatch({ type: 'SYNC_GUESTS', guests });
     }
     function onReconnect() {
-      socket.emit('rejoin-room', { sessionId });
+      socket.emit('rejoin-room', { sessionId, guestName: state.currentUser?.name, isHost: state.currentUser?.isHost });
     }
 
     socket.on('item-claimed',      onItemsSync);
@@ -102,25 +110,29 @@ export default function Summary() {
     setChangeAlert(null);
   }
 
-  // ── Venmo deep link ────────────────────────────────────────────────
-  function getVenmoLink() {
-    const amount = myTotalUSD.toFixed(2);
+  // ── Venmo payment (two-step: open Venmo, then confirm) ──────────────
+  // We no longer mark "paid" on tap — that lied to the host if the guest
+  // cancelled in Venmo. Tapping opens Venmo (app on mobile, web on desktop);
+  // the guest then confirms they actually sent it.
+  function handleVenmoTap() {
+    if (!myName || isHost) return;
+    if (changeAlert) return; // block until total change acknowledged
     const noteText = isForeign
       ? `Split the Check — my share (${formatPrice(myTotal.total)} → USD)`
       : `Split the Check — my share`;
-    const note      = encodeURIComponent(noteText);
-    const handle    = state.venmoHandle || '';
-    const recipient = handle.startsWith('@') ? handle.substring(1) : handle;
-    return `venmo://paycharge?txn=pay&recipients=${encodeURIComponent(recipient)}&amount=${amount}&note=${note}`;
+    openVenmo({ handle: state.venmoHandle, amount: myTotalUSD, note: noteText });
+    setAwaitingConfirm(true);
   }
 
-  function handleVenmoTap() {
-    if (!myName || isHost) return;
-    // Block payment if there's an unacknowledged change
-    if (changeAlert) return;
+  function confirmPaid() {
     socket.emit('mark-paid', { sessionId, guestName: myName });
-    dispatch({ type: 'MARK_PAID', guestName: myName });
-    window.location.href = getVenmoLink();
+    dispatch({ type: 'MARK_PAID', guestName: myName, status: 'paid' });
+    setAwaitingConfirm(false);
+  }
+
+  function undoPaid() {
+    socket.emit('reset-paid', { sessionId, guestName: myName });
+    dispatch({ type: 'MARK_PAID', guestName: myName, status: 'unpaid' });
   }
 
   return (
@@ -245,22 +257,49 @@ export default function Summary() {
             </div>
           )}
 
-          {changeAlert ? (
+          {isPaid ? (
+            // Already marked paid — show state + undo (covers mistakes)
+            <div className="card" style={{ background: '#e8f5e9', borderColor: '#81c784', textAlign: 'center' }}>
+              <p style={{ fontWeight: 700, color: '#1b5e20' }}>
+                {myStatus === 'confirmed' ? `✓ ${hostLabel} confirmed your payment` : '✓ You marked yourself as paid'}
+              </p>
+              {myStatus !== 'confirmed' && (
+                <button className="btn btn-ghost btn-sm mt-8" onClick={undoPaid}>That was a mistake — undo</button>
+              )}
+            </div>
+          ) : awaitingConfirm ? (
+            // Returned from Venmo — confirm the payment actually went through
+            <div className="card" style={{ borderColor: 'var(--color-accent)' }}>
+              <p style={{ fontWeight: 700, marginBottom: '4px' }}>Did you send the payment?</p>
+              <p className="text-sm text-muted" style={{ marginBottom: '12px' }}>
+                Only confirm if Venmo actually went through — the host sees this.
+              </p>
+              <div style={{ display: 'flex', gap: '8px' }}>
+                <button className="btn btn-primary btn-sm" style={{ flex: 1 }} onClick={confirmPaid}>Yes, I paid {hostLabel}</button>
+                <button className="btn btn-ghost btn-sm" onClick={() => setAwaitingConfirm(false)}>Not yet</button>
+              </div>
+              <button className="btn btn-secondary btn-sm mt-8" onClick={handleVenmoTap} style={{ width: '100%' }}>
+                Re-open Venmo
+              </button>
+            </div>
+          ) : changeAlert ? (
             // Blocked state — can't pay until change is acknowledged
             <button className="btn btn-venmo" disabled style={{ opacity: 0.45, cursor: 'not-allowed' }}>
-              Pay {state.hostName} ${myTotalUSD.toFixed(2)} on Venmo
+              Pay {hostLabel} ${myTotalUSD.toFixed(2)} on Venmo
             </button>
           ) : (
             <button className="btn btn-venmo" onClick={handleVenmoTap}>
-              Pay {state.hostName} ${myTotalUSD.toFixed(2)} on Venmo
+              Pay {hostLabel} ${myTotalUSD.toFixed(2)} on Venmo
             </button>
           )}
 
-          <p className="text-sm text-muted text-center mt-8">
-            {changeAlert
-              ? 'Acknowledge the change above before paying'
-              : 'Tapping pays and marks you as paid on the host\'s dashboard'}
-          </p>
+          {!isPaid && !awaitingConfirm && (
+            <p className="text-sm text-muted text-center mt-8">
+              {changeAlert
+                ? 'Acknowledge the change above before paying'
+                : 'Opens Venmo. You\'ll confirm here after paying.'}
+            </p>
+          )}
         </>
       )}
 

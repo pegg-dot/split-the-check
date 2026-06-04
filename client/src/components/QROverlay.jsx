@@ -47,6 +47,7 @@ export default function QROverlay() {
       sessionId: state.sessionId,
       hostName: state.hostName,
       venmoHandle: state.venmoHandle,
+      hostDisplayName: state.hostDisplayName,
       items: state.items,
       subtotal: state.subtotal,
       tax: state.tax,
