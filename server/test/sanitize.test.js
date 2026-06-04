@@ -1,6 +1,25 @@
 const { test } = require('node:test');
 const assert = require('node:assert');
-const { sanitizeScan, num, normalizeCurrency } = require('../lib/sanitize');
+const { sanitizeScan, num, normalizeCurrency, sanitizeName } = require('../lib/sanitize');
+
+test('sanitizeName strips control/zero-width chars, collapses whitespace, caps length', () => {
+  assert.strictEqual(sanitizeName('  Alex   B.  '), 'Alex B.');
+  assert.strictEqual(sanitizeName('Alex​B'), 'AlexB');     // zero-width space
+  assert.strictEqual(sanitizeName('Alex'), 'Alex');        // control char
+  assert.strictEqual(sanitizeName('x'.repeat(100)).length, 40);  // length cap
+  assert.strictEqual(sanitizeName(42), '');
+});
+
+test('sanitizeScan captures discount + printed total', () => {
+  const out = sanitizeScan({ items: [{ name: 'A', price: 10 }], discount: '5', total: '12.50' });
+  assert.strictEqual(out.discount, 5);
+  assert.strictEqual(out.total, 12.5);
+});
+
+test('tax-included note forces tax to 0 (no double-count)', () => {
+  const out = sanitizeScan({ items: [{ name: 'A', price: 10 }], tax: 2, taxNote: 'Tax included in item prices' });
+  assert.strictEqual(out.tax, 0);
+});
 
 test('num coerces strings, symbols, and EU decimal commas', () => {
   assert.strictEqual(num('12.99'), 12.99);

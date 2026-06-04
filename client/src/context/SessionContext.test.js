@@ -41,6 +41,20 @@ describe('per-person totals', () => {
     expect(round2(t.A.total + t.B.total)).toBe(39);
   });
 
+  it('discount reduces per-person totals proportionally (matches server)', () => {
+    const s = {
+      hostName: 'Host', guests: [{ name: 'A' }, { name: 'B' }],
+      subtotal: 30, tax: 0, tipPercent: 0, discount: 6,
+      items: [
+        { id: 0, name: 'Burger', price: 20, claims: [{ guestName: 'A', splitCount: 1 }] },
+        { id: 1, name: 'Salad', price: 10, claims: [{ guestName: 'B', splitCount: 1 }] },
+      ],
+    };
+    const t = calculateAllPersonTotals(s);
+    expect(t.A.total).toBe(16);
+    expect(t.B.total).toBe(8);
+  });
+
   it('client and server math agree on the "split 3 ways, 1 claimer" case', () => {
     const s = {
       hostName: 'Host', guests: [{ name: 'A' }],

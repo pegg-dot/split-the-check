@@ -231,6 +231,12 @@ export default function Summary() {
           <span>Tip {state.tipIncluded ? '(included)' : state.tipMode === 'dollar' ? '(flat)' : `(${state.tipPercent}%)`}</span>
           <span>{formatPrice(myTotal.tipShare)}</span>
         </div>
+        {myTotal.discountShare > 0 && (
+          <div className="total-row">
+            <span>Discount</span>
+            <span style={{ color: 'var(--color-success, #2e7d32)' }}>−{formatPrice(myTotal.discountShare)}</span>
+          </div>
+        )}
         <div className="total-row total-row-final">
           <span>Your total</span>
           <span>{formatPrice(myTotal.total)}</span>

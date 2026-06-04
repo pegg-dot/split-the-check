@@ -57,8 +57,10 @@ export default function QROverlay() {
       tipIncluded: state.tipIncluded,
       tipAmount: state.tipAmount,
       adminFee: state.adminFee,
+      discount: state.discount,
       currency: state.currency,
       exchangeRate: state.exchangeRate,
+      receiptTotal: state.receiptTotal,
     });
     setOpen(true);
   }

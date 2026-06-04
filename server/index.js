@@ -8,7 +8,7 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 const store = require('./store');
 const { createRateLimiter } = require('./lib/rate-limit');
-const { sanitizeScan } = require('./lib/sanitize');
+const { sanitizeScan, sanitizeName } = require('./lib/sanitize');
 const { sendEmail, notifyEnabled } = require('./lib/notify');
 const { calculateAllPersonTotals, hasOutstandingBalance } = require('./lib/totals');
 
@@ -166,7 +166,7 @@ app.post('/api/scan-receipt', scanLimiter, async (req, res) => {
       try {
         const response = await anthropic.messages.create({
           model: 'claude-sonnet-4-20250514',
-          max_tokens: 1024,
+          max_tokens: 4096, // large receipts (many items) would truncate at 1024 → JSON parse fail
           messages: [
             {
               role: 'user',
@@ -190,6 +190,8 @@ app.post('/api/scan-receipt', scanLimiter, async (req, res) => {
   "tipIncluded": false,
   "tipAmount": 0.00,
   "adminFee": 0.00,
+  "discount": 0.00,
+  "total": 0.00,
   "currency": "USD"
 }
 
@@ -219,7 +221,13 @@ OTHER CHARGES:
 - "tipAmount" = that pre-added tip amount. Do NOT double-count in both adminFee and tipAmount.
 - "currency" = ISO code from the symbol: "USD" $, "EUR" €, "GBP" £, "JPY" ¥, "CAD" C$, "AUD" A$, "MXN" for Mexican peso. Default "USD".
 
-FINAL CHECK: sum(items) + tax + adminFee + tipAmount must equal the receipt's printed TOTAL exactly (within rounding). If it doesn't, recheck your tax categorization.`,
+DISCOUNTS:
+- "discount" = the sum of any discounts, comps, promos, coupons, loyalty credits, or negative adjustment lines (labels: Discount, Comp, Promo, Coupon, Loyalty, Off, or any line with a minus sign). Return it as a POSITIVE number (the amount taken OFF the bill). 0 if none. Do NOT list discounts as items.
+
+TOTAL:
+- "total" = the final printed GRAND TOTAL on the receipt (the amount actually charged, after tax/fees/tip/discounts). Always include it if it appears anywhere on the receipt; 0 only if truly absent.
+
+FINAL CHECK: sum(items) + tax + adminFee + tipAmount − discount must equal "total" exactly (within rounding). If it doesn't, recheck your tax categorization and whether item prices already include tax.`,
                 },
               ],
             },
@@ -349,7 +357,7 @@ io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
   // Host creates a session
-  socket.on('create-session', ({ sessionId, hostName, venmoHandle, hostDisplayName, items, subtotal, tax, tipPercent, tipMode, tipDollar, tipIncluded, tipAmount, adminFee, currency, exchangeRate }) => {
+  socket.on('create-session', ({ sessionId, hostName, venmoHandle, hostDisplayName, items, subtotal, tax, tipPercent, tipMode, tipDollar, tipIncluded, tipAmount, adminFee, discount, currency, exchangeRate, receiptTotal }) => {
     let session = getSession(sessionId);
     if (!session) {
       session = createSession(sessionId, hostName, venmoHandle, hostDisplayName);
@@ -366,8 +374,10 @@ io.on('connection', (socket) => {
     session.tipIncluded = tipIncluded || false;
     session.tipAmount = tipAmount || 0;
     session.adminFee = adminFee || 0;
+    session.discount = discount || 0;
     session.currency = currency || 'USD';
     session.exchangeRate = exchangeRate || 1;
+    session.receiptTotal = receiptTotal || 0;
     store.saveSession(session);
     socket.join(sessionId);
     socketMeta.set(socket.id, { sessionId, name: hostName, isHost: true });
@@ -397,7 +407,7 @@ io.on('connection', (socket) => {
       return;
     }
 
-    const name = (guestName || '').trim();
+    const name = sanitizeName(guestName);
     if (!name) {
       socket.emit('error', { message: 'Please enter a name' });
       return;

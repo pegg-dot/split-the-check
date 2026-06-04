@@ -20,6 +20,7 @@ export default function ReviewItems() {
     if (state.tax > 0) list.push({ id: nextId++, type: 'tax', label: 'Tax', amount: state.tax.toFixed(2) });
     if (state.adminFee > 0) list.push({ id: nextId++, type: 'admin', label: 'Service Charge', amount: state.adminFee.toFixed(2) });
     if (state.tipIncluded && state.tipAmount > 0) list.push({ id: nextId++, type: 'gratuity', label: 'Gratuity', amount: state.tipAmount.toFixed(2), detected: true });
+    if (state.discount > 0) list.push({ id: nextId++, type: 'discount', label: 'Discount', amount: state.discount.toFixed(2), detected: true });
     return list;
   });
   const [showAddMenu, setShowAddMenu] = useState(false);
@@ -93,11 +94,13 @@ export default function ReviewItems() {
     const taxTotal = sumFeesOfType('tax');
     const adminTotal = sumFeesOfType('admin');
     const gratuityTotal = round2(sumFeesOfType('gratuity'));
+    const discountTotal = round2(sumFeesOfType('discount'));
     const hasGratuity = gratuityTotal > 0;
 
-    console.log('[ReviewItems] handleContinue →', { taxTotal, adminTotal, gratuityTotal, hasGratuity, items: state.items.length });
+    console.log('[ReviewItems] handleContinue →', { taxTotal, adminTotal, gratuityTotal, discountTotal, hasGratuity, items: state.items.length });
     dispatch({ type: 'SET_TAX', tax: taxTotal });
     dispatch({ type: 'SET_ADMIN_FEE', adminFee: adminTotal });
+    dispatch({ type: 'SET_SCAN_EXTRAS', discount: discountTotal, receiptTotal: state.receiptTotal });
     dispatch({ type: 'SET_TIP_INCLUDED', tipIncluded: hasGratuity, tipAmount: gratuityTotal });
     // When gratuity is already on the receipt, default to "No tip" so the host
     // isn't accidentally charged an extra 18% on top of the auto-gratuity.
@@ -126,10 +129,17 @@ export default function ReviewItems() {
   const formatPrice = (p) => fmtPrice(p, state.currency || 'USD');
   const curSym = currencySymbol(state.currency || 'USD');
 
-  // Calculate preview total (fees array now includes gratuity if detected)
+  // Calculate preview total: charges add, discounts subtract.
   const previewSubtotal = state.subtotal;
-  const feesTotal = round2(fees.reduce((s, f) => round2(s + (parseFloat(f.amount) || 0)), 0));
-  const previewTotal = round2(previewSubtotal + feesTotal);
+  const chargeTotal = round2(fees.filter(f => f.type !== 'discount').reduce((s, f) => round2(s + (parseFloat(f.amount) || 0)), 0));
+  const discountTotal = round2(fees.filter(f => f.type === 'discount').reduce((s, f) => round2(s + (parseFloat(f.amount) || 0)), 0));
+  const previewTotal = round2(previewSubtotal + chargeTotal - discountTotal);
+
+  // Reconcile against the printed grand total from the scan (catches mis-read
+  // tax, e.g. tax already included in prices, or dropped lines).
+  const scannedTotal = round2(state.receiptTotal || 0);
+  const reconcileDiff = scannedTotal > 0 ? round2(previewTotal - scannedTotal) : 0;
+  const reconcileOff = scannedTotal > 0 && Math.abs(reconcileDiff) > 0.02;
 
   // Check if any item in a group is being edited
   const editingGroup = editingId !== null
@@ -326,6 +336,7 @@ export default function ReviewItems() {
           }}>
             <button className="btn btn-ghost btn-sm" style={{ justifyContent: 'flex-start' }} onClick={() => addFee('tax', 'Tax')}>Tax / VAT / IVA</button>
             <button className="btn btn-ghost btn-sm" style={{ justifyContent: 'flex-start' }} onClick={() => addFee('admin', 'Service Charge')}>Service / Admin Fee</button>
+            <button className="btn btn-ghost btn-sm" style={{ justifyContent: 'flex-start' }} onClick={() => addFee('discount', 'Discount')}>Discount / Comp / Promo</button>
             <button className="btn btn-ghost btn-sm" style={{ justifyContent: 'flex-start' }} onClick={() => addFee('admin', '')}>Other / Custom</button>
           </div>
         )}
@@ -337,21 +348,45 @@ export default function ReviewItems() {
           <span>Subtotal</span>
           <span className="fw-700">{formatPrice(previewSubtotal)}</span>
         </div>
-        {fees.filter(f => (parseFloat(f.amount) || 0) > 0).map((fee) => (
-          <div key={fee.id} className="total-row">
-            <span className="text-muted">{fee.label || 'Fee'}</span>
-            <span>{formatPrice(parseFloat(fee.amount) || 0)}</span>
-          </div>
-        ))}
+        {fees.filter(f => (parseFloat(f.amount) || 0) > 0).map((fee) => {
+          const amt = parseFloat(fee.amount) || 0;
+          const isDiscount = fee.type === 'discount';
+          return (
+            <div key={fee.id} className="total-row">
+              <span className="text-muted">{fee.label || (isDiscount ? 'Discount' : 'Fee')}</span>
+              <span style={isDiscount ? { color: 'var(--color-success, #2e7d32)' } : undefined}>
+                {isDiscount ? '−' : ''}{formatPrice(amt)}
+              </span>
+            </div>
+          );
+        })}
         <div className="total-row total-row-final">
           <span>Receipt Total</span>
           <span>{formatPrice(previewTotal)}</span>
         </div>
       </div>
 
-      <p className="text-sm text-muted text-center mt-8">
-        Verify these match your receipt before continuing
-      </p>
+      {/* Reconciliation against the printed grand total from the scan */}
+      {reconcileOff ? (
+        <div className="card mt-8" style={{ borderColor: 'var(--color-warning, #E5A20A)', background: '#fff8e1' }}>
+          <p className="text-sm" style={{ fontWeight: 700, color: '#bf360c' }}>
+            ⚠ This doesn't match the receipt total
+          </p>
+          <p className="text-sm text-muted mt-8">
+            The receipt shows <strong>{formatPrice(scannedTotal)}</strong>, but your items + charges add to{' '}
+            <strong>{formatPrice(previewTotal)}</strong> ({reconcileDiff > 0 ? 'over' : 'under'} by {formatPrice(Math.abs(reconcileDiff))}).
+            Check for a missed item, tax, or discount before continuing.
+          </p>
+        </div>
+      ) : scannedTotal > 0 ? (
+        <p className="text-sm text-center mt-8" style={{ color: 'var(--color-success, #2e7d32)', fontWeight: 600 }}>
+          ✓ Matches the receipt total of {formatPrice(scannedTotal)}
+        </p>
+      ) : (
+        <p className="text-sm text-muted text-center mt-8">
+          Verify these match your receipt before continuing
+        </p>
+      )}
 
       <div className="spacer" />
 

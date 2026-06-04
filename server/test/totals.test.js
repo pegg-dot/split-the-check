@@ -97,6 +97,22 @@ test('calculateUnaccounted: everything claimed → 0', () => {
   assert.strictEqual(calculateUnaccounted(session).totalUnaccounted, 0);
 });
 
+test('discount is distributed proportionally and subtracted from totals', () => {
+  const session = {
+    hostName: 'Host', guests: [{ name: 'A' }, { name: 'B' }],
+    subtotal: 30, tax: 0, tipPercent: 0, discount: 6,
+    items: [
+      { id: 0, name: 'Burger', price: 20, claims: [{ guestName: 'A', splitCount: 1 }] },
+      { id: 1, name: 'Salad', price: 10, claims: [{ guestName: 'B', splitCount: 1 }] },
+    ],
+  };
+  const t = calculateAllPersonTotals(session);
+  // discount 6 split 20:10 → A −4, B −2 → A=16, B=8, sum=24=30−6
+  assert.strictEqual(t.A.total, 16);
+  assert.strictEqual(t.B.total, 8);
+  assert.strictEqual(round2(t.A.total + t.B.total), 24);
+});
+
 test('quantity item: per-unit shares split correctly', () => {
   const session = {
     hostName: 'Host', guests: [{ name: 'A' }, { name: 'B' }],

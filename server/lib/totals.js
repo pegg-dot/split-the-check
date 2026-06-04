@@ -70,9 +70,11 @@ function calculateAllPersonTotals(session) {
     }
   }
 
+  const discount = session.discount || 0;
   const weights = names.map(n => itemTotals[n]);
   const taxShares      = distributeProportionally(tax || 0, weights);
   const adminFeeShares = distributeProportionally(adminFee || 0, weights);
+  const discountShares = distributeProportionally(discount, weights); // comps/promos, subtracted
   const includedGratuityShares = tipIncluded ? distributeProportionally(tipAmount || 0, weights) : names.map(() => 0);
 
   let additionalTipShares;
@@ -91,9 +93,10 @@ function calculateAllPersonTotals(session) {
     const iTotal     = itemTotals[name];
     const taxShare   = taxShares[i];
     const adminShare = adminFeeShares[i];
+    const discountShare = discountShares[i];
     const tipShare   = round2(includedGratuityShares[i] + additionalTipShares[i]);
-    const total      = round2(iTotal + taxShare + tipShare + adminShare);
-    result[name] = { itemsTotal: iTotal, taxShare, tipShare, adminFeeShare: adminShare, total, claimedItems: claimedItemsMap[name] };
+    const total      = round2(Math.max(0, iTotal + taxShare + tipShare + adminShare - discountShare));
+    result[name] = { itemsTotal: iTotal, taxShare, tipShare, adminFeeShare: adminShare, discountShare, total, claimedItems: claimedItemsMap[name] };
   });
   return result;
 }

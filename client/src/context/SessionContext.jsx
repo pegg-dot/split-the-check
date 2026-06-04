@@ -26,11 +26,13 @@ const initialState = {
   tipIncluded: false,  // true if receipt already has gratuity
   tipAmount: 0,        // pre-included tip amount from receipt
   adminFee: 0,         // admin/service fee from receipt
+  discount: 0,         // comps/promos/coupons (positive), reduces the bill
 
   // Currency + exchange rate to USD
   currency: 'USD',
   exchangeRate: 1,
   taxNote: '', // e.g. "Tax included in item prices"
+  receiptTotal: 0, // printed grand total from the scan (for reconciliation)
 
   // Session
   sessionId: null,
@@ -101,6 +103,14 @@ function sessionReducer(state, action) {
     }
     case 'SET_ADMIN_FEE': {
       return { ...state, adminFee: action.adminFee };
+    }
+    case 'SET_SCAN_EXTRAS': {
+      // Discount + printed receipt total captured from the scan.
+      return {
+        ...state,
+        discount: action.discount || 0,
+        receiptTotal: action.receiptTotal || 0,
+      };
     }
     case 'SET_CURRENCY': {
       return { ...state, currency: action.currency || 'USD', exchangeRate: action.exchangeRate || 1 };
@@ -220,8 +230,10 @@ function sessionReducer(state, action) {
         tipIncluded: s.tipIncluded || false,
         tipAmount: s.tipAmount || 0,
         adminFee: s.adminFee || 0,
+        discount: s.discount || 0,
         currency: s.currency || 'USD',
         exchangeRate: s.exchangeRate || 1,
+        receiptTotal: s.receiptTotal || 0,
         sessionId: s.id,
         guests: s.guests,
         payments: s.payments || [],
@@ -249,8 +261,8 @@ export function round2(n) {
 
 // Calculate what a person owes — all values rounded to 2dp
 export function calculatePersonTotal(state, personName) {
-  const { items, tax, subtotal, tipPercent, tipIncluded, tipAmount, adminFee } = state;
-  if (!subtotal || subtotal === 0) return { itemsTotal: 0, taxShare: 0, tipShare: 0, adminFeeShare: 0, total: 0, claimedItems: [], unclaimedItems: [] };
+  const { items, tax, subtotal, tipPercent, tipIncluded, tipAmount, adminFee, discount } = state;
+  if (!subtotal || subtotal === 0) return { itemsTotal: 0, taxShare: 0, tipShare: 0, adminFeeShare: 0, discountShare: 0, total: 0, claimedItems: [], unclaimedItems: [] };
 
   let itemsTotal = 0;
   const claimedItems = [];
@@ -275,6 +287,7 @@ export function calculatePersonTotal(state, personName) {
   const proportion = subtotal > 0 ? itemsTotal / subtotal : 0;
   const taxShare   = round2(Math.max(0, (tax || 0) * proportion));
   const adminFeeShare = round2(Math.max(0, (adminFee || 0) * proportion));
+  const discountShare = round2(Math.max(0, (discount || 0) * proportion));
 
   const tipMode   = state.tipMode || 'percent';
   const tipDollar = Math.max(0, state.tipDollar || 0);
@@ -289,9 +302,9 @@ export function calculatePersonTotal(state, personName) {
     tipShare = round2(tipShare + Math.max(0, itemsTotal * ((tipPercent || 0) / 100)));
   }
 
-  const total = round2(itemsTotal + taxShare + tipShare + adminFeeShare);
+  const total = round2(Math.max(0, itemsTotal + taxShare + tipShare + adminFeeShare - discountShare));
 
-  return { itemsTotal, taxShare, tipShare, adminFeeShare, total, claimedItems, unclaimedItems };
+  return { itemsTotal, taxShare, tipShare, adminFeeShare, discountShare, total, claimedItems, unclaimedItems };
 }
 
 // Distribute `total` dollars among `weights` proportionally using the largest-remainder
@@ -318,13 +331,13 @@ export function distributeProportionally(total, weights) {
 // Use this wherever totals must sum to the receipt grand total (dashboard, summary).
 // `calculatePersonTotal` is still fine for live running totals during claiming.
 export function calculateAllPersonTotals(state) {
-  const { items, tax, subtotal, tipPercent, tipIncluded, tipAmount, adminFee } = state;
+  const { items, tax, subtotal, tipPercent, tipIncluded, tipAmount, adminFee, discount } = state;
   const tipMode   = state.tipMode || 'percent';
   const tipDollar = Math.max(0, state.tipDollar || 0);
 
   const names = getAllParticipants(state);
   if (!subtotal || subtotal === 0 || names.length === 0) {
-    return Object.fromEntries(names.map(n => [n, { itemsTotal: 0, taxShare: 0, tipShare: 0, adminFeeShare: 0, total: 0, claimedItems: [], unclaimedItems: [] }]));
+    return Object.fromEntries(names.map(n => [n, { itemsTotal: 0, taxShare: 0, tipShare: 0, adminFeeShare: 0, discountShare: 0, total: 0, claimedItems: [], unclaimedItems: [] }]));
   }
 
   // Per-person item totals (exact, not rounded yet)
@@ -358,6 +371,7 @@ export function calculateAllPersonTotals(state) {
   // Distribute tax, adminFee, and tip using largest-remainder so sums are exact
   const taxShares      = distributeProportionally(tax || 0, weights);
   const adminFeeShares = distributeProportionally(adminFee || 0, weights);
+  const discountShares = distributeProportionally(discount || 0, weights); // comps/promos, subtracted
 
   // Tip: included gratuity + additional tip chosen by host
   const includedGratuityShares = tipIncluded
@@ -381,13 +395,15 @@ export function calculateAllPersonTotals(state) {
     const iTotal      = itemTotals[name];
     const taxShare    = taxShares[i];
     const adminShare  = adminFeeShares[i];
+    const discountShare = discountShares[i];
     const tipShare    = round2(includedGratuityShares[i] + additionalTipShares[i]);
-    const total       = round2(iTotal + taxShare + tipShare + adminShare);
+    const total       = round2(Math.max(0, iTotal + taxShare + tipShare + adminShare - discountShare));
     result[name] = {
       itemsTotal:   iTotal,
       taxShare,
       tipShare,
       adminFeeShare: adminShare,
+      discountShare,
       total,
       claimedItems: claimedItemsMap[name],
       unclaimedItems,

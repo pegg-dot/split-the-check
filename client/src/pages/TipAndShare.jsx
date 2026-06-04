@@ -28,20 +28,22 @@ export default function TipAndShare() {
     additionalTip = round2(Math.max(0, state.subtotal * (Math.max(0, state.tipPercent || 0) / 100)));
   }
 
-  const grandTotal = round2(
+  const grandTotal = round2(Math.max(0,
     Math.max(0, state.subtotal) +
     Math.max(0, state.tax) +
     Math.max(0, state.adminFee || 0) +
     includedGratuity +
-    additionalTip
-  );
+    additionalTip -
+    Math.max(0, state.discount || 0)
+  ));
 
   console.log('[TipAndShare] Calculated:', { includedGratuity, additionalTip, grandTotal });
 
   // Generate session ID if not set
   useEffect(() => {
     if (!state.sessionId) {
-      const id = Math.random().toString(36).substring(2, 8);
+      // 10 chars of base36 (~3.6e15 space) — avoids collision/hijack of a live session.
+      const id = Math.random().toString(36).substring(2, 12);
       dispatch({ type: 'SET_SESSION_ID', sessionId: id });
     }
   }, [state.sessionId, dispatch]);
@@ -71,8 +73,10 @@ export default function TipAndShare() {
       tipIncluded: state.tipIncluded,
       tipAmount: state.tipAmount,
       adminFee: state.adminFee,
+      discount: state.discount,
       currency: state.currency,
       exchangeRate: state.exchangeRate,
+      receiptTotal: state.receiptTotal,
     });
   }, [sessionId, state.tipPercent, state.tipMode, state.tipDollar, state.tipIncluded]);
 
@@ -149,6 +153,12 @@ export default function TipAndShare() {
           <span>Tax</span>
           <span className="fw-700">{formatPrice(state.tax)}</span>
         </div>
+        {state.discount > 0 && (
+          <div className="total-row">
+            <span>Discount</span>
+            <span className="fw-700" style={{ color: 'var(--color-success, #2e7d32)' }}>−{formatPrice(state.discount)}</span>
+          </div>
+        )}
         {includedGratuity > 0 && (
           <div className="total-row">
             <span>Gratuity (included)</span>

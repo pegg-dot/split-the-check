@@ -113,6 +113,7 @@ export default function ScanReceipt() {
     dispatch({ type: 'SET_TAX', tax: data.tax || 0, taxNote: data.taxNote || '' });
     if (data.adminFee) dispatch({ type: 'SET_ADMIN_FEE', adminFee: data.adminFee });
     if (data.tipIncluded) dispatch({ type: 'SET_TIP_INCLUDED', tipIncluded: true, tipAmount: data.tipAmount || 0 });
+    dispatch({ type: 'SET_SCAN_EXTRAS', discount: data.discount || 0, receiptTotal: data.total || 0 });
     dispatch({ type: 'SET_CURRENCY', currency: useCurrency, exchangeRate: useCurrency === data.currency ? (data.exchangeRate || 1) : 1 });
     navigate('/review');
   }
